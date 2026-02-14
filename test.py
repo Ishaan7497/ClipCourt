@@ -2,9 +2,13 @@ import cv2
 
 cap = cv2.VideoCapture("game.mp4")
 
-x, y = 200, 400        # start lower
-dx, dy = 3, -2         # moving up
+x, y = 200, 900        # start lower
+dx, dy = 3, -80
+  
+
+paused_on_peak = False
 prev_y = y             # store previous y
+prev_direction = None  
 
 trail = []             # store past positions
 MAX_POINTS = 25        # trail length
@@ -17,14 +21,20 @@ while True:
     # Move ball
     x += dx
     y += dy
+    dy += 4   
 
     # Detect upward motion + choose color
-    if y < prev_y:
+    if dy<0:
         direction = "UP"
+        paused_on_peak = False
         ball_color = (0, 255, 0)   # green
     else:
         direction = "DOWN"
         ball_color = (0, 0, 255)   # red
+
+    peak_detected = False
+    if prev_direction == "UP" and direction == "DOWN":
+        peak_detected = True
 
     #Save position to trail
     trail.append((x, y))
@@ -32,13 +42,13 @@ while True:
         trail.pop(0)
 
     #Draw the trail
-    for i in range(1, len(trail)):
+    for i in range(1,len(trail)):
         cv2.line(
             frame,
             trail[i - 1],
             trail[i],
             (255, 0, 0),   # blue trail
-            2
+            3
         )
 
     # Draw the ball
@@ -54,16 +64,35 @@ while True:
         ball_color,
         2
     )
+    
+    
+    if peak_detected and not paused_on_peak:
+        cv2.putText(frame, "PEAK",
+                (30, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                3)
 
-    prev_y = y  # update previous y
+        cv2.imshow("Basketball Video", frame)
+        cv2.waitKey(2000)
+        paused_on_peak = True
+    
+    else:
+        cv2.imshow("Basketball Video", frame)
+        if cv2.waitKey(25) & 0xFF == ord('q'):
+            break
 
-    cv2.imshow("Basketball Video", frame)
+    # Update memory
+    prev_y = y
+    prev_direction = direction  
 
-    if cv2.waitKey(25) & 0xFF == ord('q'):
+
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-
 
 
