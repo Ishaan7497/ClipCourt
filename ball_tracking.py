@@ -4,7 +4,7 @@ import os
 # -----------------------------
 # OPEN VIDEO
 # -----------------------------
-cap = cv2.VideoCapture("game.mp4")
+cap = cv2.VideoCapture("tt.mp4")
 
 # -----------------------------
 # VIDEO INFO
@@ -65,7 +65,6 @@ while True:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) #converts from bgr scale 2 hsv scale = hue saturation brightness(value)
 
     # Keep only basketball color
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, LOWER_BALL, UPPER_BALL)
     
 
