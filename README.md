@@ -34,6 +34,16 @@ watch clips / download zip ────▶ GET  /jobs/{id}/clips[.zip] ◀──
 3. **HoopShotDetector** arms when a descending ball enters the attempt zone, and calls **MADE** only if the ball was *measured* descending through the rim band before being seen below it — a front-of-rim brick that drops below rim level is a **MISS**. A cooldown suppresses rebound double-triggers, and direction is never inferred across a stale gap (`direction_gap_frames`).
 4. **Clipping** merges overlapping shot windows and cuts each with a frame-accurate ffmpeg re-encode (audio preserved). No `cap.set()` keyframe drift in either path.
 
+## Coaching features
+
+The results page doubles as a film-room dashboard:
+
+- **Roster** — add/remove players per video (persisted to `data/videos/<id>/roster.json`); each player gets an auto-assigned color.
+- **Shot chart** — every detected shot is plotted on a half-court diagram (green = made, red = miss, ring color = player). Locations are *approximate*: the ball's pixel position at shot resolution, scaled by the known 18-inch rim width — a single fixed camera can't triangulate true court position.
+- **Tagging** — assign a player and a drill type (Layups / 3-Pointers / Mid-range) to each shot from its clip card; assignments persist to `coaching.json` next to the clips. A drill filter narrows the chart and clip grid.
+- **Stats** — live per-player cards (FG%, made/missed, close/mid/deep splits) plus a team total.
+- **Export** — `export.csv` (player, result, time, location, confidence, drill) and `export.pdf` (court chart + stats tables via matplotlib/reportlab).
+
 ## Accessibility
 
 - Full keyboard flow, including rim marking on the canvas (arrows move, Shift+arrows resize, Delete clears, Alt for 1-px nudge) plus plain numeric x/y/w/h fields as an equivalent.
@@ -72,4 +82,4 @@ The engine is fully headless (no GUI, no `input()`, no display probing). For pro
 - [ ] Batch queue UI (process a whole season of games)
 - [ ] Auto-suggest the rim box (rim detector model) with manual confirm
 - [ ] Vertical/social reframe export
-- [ ] Per-session shot chart from event coordinates
+- [x] Per-session shot chart from event coordinates

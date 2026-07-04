@@ -27,12 +27,15 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+from typing import Literal, Optional
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import engine
+import export
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -50,9 +53,15 @@ app = FastAPI(title="HoopClip")
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
+_files_lock = threading.Lock()  # guards read-modify-write of roster.json / coaching.json
 _videos: dict[str, dict] = {}
 _jobs: dict[str, "Job"] = {}
 _executor = ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) // 2))
+
+# Auto-assigned player colors — distinct on the dark film-room theme and
+# deliberately avoiding the made/miss green/red so markers stay readable.
+PLAYER_PALETTE = ["#f2c14e", "#8ecbff", "#e9701e", "#c9a0ff",
+                  "#6fd6c4", "#f28db2", "#efeae0", "#a0b8ff"]
 
 
 @dataclass
@@ -66,6 +75,7 @@ class Job:
     events: list = field(default_factory=list)
     clips: list = field(default_factory=list)
     error: str | None = None
+    hoop_box: tuple | None = None   # (x, y, w, h) in source pixels
     cancel_flag: threading.Event = field(default_factory=threading.Event)
     created_at: float = field(default_factory=time.time)
 
@@ -170,6 +180,77 @@ def delete_video(video_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Roster (per-video player list, persisted next to the video files)
+# ---------------------------------------------------------------------------
+
+class PlayerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    number: Optional[str] = Field(default=None, max_length=8)
+
+
+def _roster_path(video: dict) -> str:
+    return os.path.join(video["dir"], "roster.json")
+
+
+def _load_roster(video: dict) -> dict:
+    path = _roster_path(video)
+    if not os.path.isfile(path):
+        return {"video_id": video["id"], "players": []}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_roster(video: dict, roster: dict):
+    with open(_roster_path(video), "w") as f:
+        json.dump(roster, f, indent=2)
+
+
+def _next_color(players: list) -> str:
+    used = {p.get("color") for p in players}
+    for c in PLAYER_PALETTE:
+        if c not in used:
+            return c
+    return PLAYER_PALETTE[len(players) % len(PLAYER_PALETTE)]
+
+
+@app.get("/api/videos/{video_id}/roster")
+def get_roster(video_id: str):
+    video = _video_or_404(video_id)
+    with _files_lock:
+        return _load_roster(video)
+
+
+@app.post("/api/videos/{video_id}/roster", status_code=201)
+def add_player(video_id: str, req: PlayerCreate):
+    video = _video_or_404(video_id)
+    with _files_lock:
+        roster = _load_roster(video)
+        player = {
+            "id": f"p_{uuid.uuid4().hex[:8]}",
+            "name": req.name.strip(),
+            "number": req.number,
+            "color": _next_color(roster["players"]),
+            "created_at": time.time(),
+        }
+        roster["players"].append(player)
+        _save_roster(video, roster)
+    return player
+
+
+@app.delete("/api/videos/{video_id}/roster/{player_id}")
+def remove_player(video_id: str, player_id: str):
+    video = _video_or_404(video_id)
+    with _files_lock:
+        roster = _load_roster(video)
+        kept = [p for p in roster["players"] if p["id"] != player_id]
+        if len(kept) == len(roster["players"]):
+            raise HTTPException(404, "Player not found.")
+        roster["players"] = kept
+        _save_roster(video, roster)
+    return {"deleted": player_id}
+
+
+# ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
 
@@ -198,7 +279,8 @@ def create_job(req: JobRequest):
     if b.x + b.w > v["width"] + 2 or b.y + b.h > v["height"] + 2:
         raise HTTPException(422, "The rim box falls outside the video frame. Mark it again.")
 
-    job = Job(id=uuid.uuid4().hex, video_id=req.video_id, mode=req.mode)
+    job = Job(id=uuid.uuid4().hex, video_id=req.video_id, mode=req.mode,
+              hoop_box=(b.x, b.y, b.w, b.h))
     with _lock:
         _jobs[job.id] = job
 
@@ -240,6 +322,7 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
             video["path"], analysis, job.mode, clip_dir, cfg,
             on_progress=progress,
         )
+        _write_coaching_meta(video, job.id, hoop_box)
         job.progress = 1.0
         n = len(job.clips)
         job.message = (f"Done — {n} clip{'s' if n != 1 else ''} cut"
@@ -253,7 +336,7 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
-    return _job_or_404(job_id).snapshot()
+    return _job_snapshot_enriched(_job_or_404(job_id))
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -261,6 +344,86 @@ def cancel_job(job_id: str):
     job = _job_or_404(job_id)
     job.cancel_flag.set()
     return {"cancelling": job_id}
+
+
+# ---------------------------------------------------------------------------
+# Coaching: per-shot player/drill assignments (persisted next to the clips)
+# ---------------------------------------------------------------------------
+
+DrillTag = Literal["layups", "three_pointers", "midrange"]
+
+
+class ShotAssignment(BaseModel):
+    # Full replace, not a partial patch — the client always sends both fields.
+    player_id: Optional[str] = None
+    drill_tag: Optional[DrillTag] = None
+
+
+def _coaching_path(video: dict, job_id: str) -> str:
+    d = os.path.join(video["dir"], "clips", job_id)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "coaching.json")
+
+
+def _load_coaching(video: dict, job_id: str) -> dict:
+    path = _coaching_path(video, job_id)
+    if not os.path.isfile(path):
+        return {"hoop_box": None, "rim_diameter_ft": engine.RIM_DIAMETER_FT,
+                "assignments": {}}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _write_coaching_meta(video: dict, job_id: str, hoop_box: tuple):
+    with _files_lock:
+        data = _load_coaching(video, job_id)
+        data["hoop_box"] = dict(zip(("x", "y", "w", "h"), hoop_box))
+        data["rim_diameter_ft"] = engine.RIM_DIAMETER_FT
+        data.setdefault("assignments", {})
+        with open(_coaching_path(video, job_id), "w") as f:
+            json.dump(data, f, indent=2)
+
+
+def _job_snapshot_enriched(job: Job) -> dict:
+    """Job snapshot plus per-event assignments and approximate court coords."""
+    snap = job.snapshot()
+    assignments = {}
+    if job.status == "done":
+        video = _video_or_404(job.video_id)
+        with _files_lock:
+            assignments = _load_coaching(video, job.id).get("assignments", {})
+    for ev in snap["events"]:
+        a = assignments.get(str(ev["frame"]), {})
+        ev["player_id"] = a.get("player_id")
+        ev["drill_tag"] = a.get("drill_tag")
+        if job.hoop_box and ev.get("ball_x") is not None:
+            ev["court_x_ft"], ev["court_dist_ft"] = engine.approx_shot_location_ft(
+                ev["ball_x"], ev["ball_y"], job.hoop_box)
+        else:
+            ev["court_x_ft"] = ev["court_dist_ft"] = None
+    return snap
+
+
+@app.patch("/api/jobs/{job_id}/shots/{frame}")
+def assign_shot(job_id: str, frame: int, req: ShotAssignment):
+    job = _job_or_404(job_id)
+    if job.status != "done":
+        raise HTTPException(409, "Wait for the job to finish before assigning shots.")
+    if not any(e["frame"] == frame for e in job.events):
+        raise HTTPException(404, "Shot not found for this job.")
+    video = _video_or_404(job.video_id)
+    if req.player_id is not None:
+        roster = _load_roster(video)
+        if not any(p["id"] == req.player_id for p in roster["players"]):
+            raise HTTPException(422, "Unknown player — add them to the roster first.")
+    with _files_lock:
+        data = _load_coaching(video, job_id)
+        data.setdefault("assignments", {})[str(frame)] = {
+            "player_id": req.player_id, "drill_tag": req.drill_tag,
+        }
+        with open(_coaching_path(video, job_id), "w") as f:
+            json.dump(data, f, indent=2)
+    return {"frame": frame, "player_id": req.player_id, "drill_tag": req.drill_tag}
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +459,47 @@ def get_clips_zip(job_id: str):
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="hoopclip_clips.zip"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exports (CSV stats + PDF report)
+# ---------------------------------------------------------------------------
+
+def _export_ready_or_raise(job_id: str) -> tuple:
+    job = _job_or_404(job_id)
+    if job.status != "done":
+        raise HTTPException(409, "Wait for the job to finish before exporting.")
+    if not job.events:
+        raise HTTPException(404, "No shots to export for this job.")
+    video = _video_or_404(job.video_id)
+    with _files_lock:
+        players_by_id = {p["id"]: p for p in _load_roster(video)["players"]}
+    return job, video, players_by_id
+
+
+@app.get("/api/jobs/{job_id}/export.csv")
+def export_csv(job_id: str):
+    job, _video, players_by_id = _export_ready_or_raise(job_id)
+    csv_text = export.build_csv(_job_snapshot_enriched(job)["events"], players_by_id)
+    # utf-8-sig BOM so the file opens cleanly in Excel.
+    return Response(
+        content=csv_text.encode("utf-8-sig"), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="hoopclip_stats.csv"'},
+    )
+
+
+@app.get("/api/jobs/{job_id}/export.pdf")
+def export_pdf(job_id: str):
+    job, video, players_by_id = _export_ready_or_raise(job_id)
+    try:
+        pdf_bytes = export.build_pdf(
+            _job_snapshot_enriched(job), players_by_id, video["display_name"])
+    except RuntimeError as exc:  # missing matplotlib/reportlab
+        raise HTTPException(501, str(exc))
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="hoopclip_report.pdf"'},
     )
 
 

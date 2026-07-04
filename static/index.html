@@ -136,9 +136,75 @@
       </div>
       <p class="step-sub" id="resultsSummary"></p>
 
+      <!-- Coaching: roster + shot chart -->
+      <div class="coaching-grid">
+        <aside class="roster-panel" aria-labelledby="h-roster">
+          <h3 id="h-roster">Roster</h3>
+          <p class="hint">Add players, then tag each shot with the pickers on
+            its clip — or activate a chart marker to jump straight there.</p>
+          <div class="roster-add">
+            <label class="visually-hidden" for="playerName">Player name</label>
+            <input type="text" id="playerName" maxlength="80"
+                   placeholder="Player name" autocomplete="off">
+            <button class="btn-primary btn-small" id="addPlayerBtn">Add</button>
+          </div>
+          <ul class="roster-list" id="rosterList"></ul>
+          <p class="status-line" id="rosterStatus" role="status" aria-live="polite"></p>
+        </aside>
+
+        <section class="court-panel" aria-labelledby="h-court">
+          <h3 id="h-court">Shot chart</h3>
+          <div class="court-diagram" id="courtDiagram" role="group"
+               aria-labelledby="h-court" aria-describedby="courtHint">
+            <svg class="court-bg" viewBox="0 0 50 47" preserveAspectRatio="xMidYMid meet"
+                 aria-hidden="true" focusable="false">
+              <rect x="0.2" y="0.2" width="49.6" height="46.6" fill="none"
+                    stroke="var(--line)" stroke-width="0.35"/>
+              <rect x="17" y="0.2" width="16" height="18.8" fill="none"
+                    stroke="var(--line)" stroke-width="0.22"/>
+              <circle cx="25" cy="19" r="6" fill="none"
+                      stroke="var(--line)" stroke-width="0.22"/>
+              <path d="M 3 0.2 L 3 14.2 A 23.75 23.75 0 0 0 47 14.2 L 47 0.2"
+                    fill="none" stroke="var(--line)" stroke-width="0.22"/>
+              <line x1="22" y1="4.25" x2="28" y2="4.25"
+                    stroke="var(--chalk-dim)" stroke-width="0.3"/>
+              <circle cx="25" cy="5.25" r="0.75" fill="none"
+                      stroke="var(--chalk-dim)" stroke-width="0.28"/>
+            </svg>
+            <!-- shot marker buttons injected by app.js -->
+          </div>
+          <p class="hint" id="courtHint">Locations are approximate — estimated from a
+            single camera angle. Tab through the markers; activate one to tag that shot.</p>
+          <p class="status-line" id="courtStatus" role="status" aria-live="polite"></p>
+          <ul class="court-legend" id="courtLegend" aria-label="Shot chart legend"></ul>
+          <div class="export-actions">
+            <a class="btn-ghost" id="csvLink" href="#" download hidden>Download CSV</a>
+            <a class="btn-ghost" id="pdfLink" href="#" download hidden>Download PDF</a>
+          </div>
+        </section>
+      </div>
+
+      <!-- Coaching: per-player stats -->
+      <section class="stats-panel" aria-labelledby="h-stats">
+        <h3 id="h-stats">Stats</h3>
+        <div class="stats-dash" id="statsDash"></div>
+      </section>
+
+      <fieldset class="drill-filter">
+        <legend>Filter by drill</legend>
+        <div class="radio-row">
+          <label><input type="radio" name="drill" value="all" checked> All shots</label>
+          <label><input type="radio" name="drill" value="layups"> Layups</label>
+          <label><input type="radio" name="drill" value="three_pointers"> 3-Pointers</label>
+          <label><input type="radio" name="drill" value="midrange"> Mid-range</label>
+        </div>
+        <p class="status-line" id="drillStats" role="status" aria-live="polite"></p>
+      </fieldset>
+
       <div class="timeline" id="timeline" role="group" aria-label="Shot timeline. Each marker is a detected shot; activate one to jump to its clip."></div>
       <div class="timeline-caption"><span>0:00</span><span id="timelineEnd">—</span></div>
 
+      <p class="status-line" id="assignStatus" role="status" aria-live="polite"></p>
       <div class="clip-grid" id="clipGrid"></div>
 
       <div class="results-actions">

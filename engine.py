@@ -98,9 +98,31 @@ class ShotEvent:
     time_s: float
     result: str            # "made" | "miss"
     confidence: str        # "high" | "medium"  (2D single-camera honesty)
+    ball_x: Optional[float] = None   # pixel x when the shot resolved (or last seen)
+    ball_y: Optional[float] = None   # pixel y when the shot resolved (or last seen)
 
     def to_dict(self):
         return asdict(self)
+
+
+RIM_DIAMETER_FT = 1.5  # 18-inch inside diameter — the real-world scale anchor
+
+
+def approx_shot_location_ft(ball_x: float, ball_y: float, hoop_box: tuple) -> tuple:
+    """Approximate offset from the rim in feet, scaled from the rim box width.
+
+    Returns (dx_ft, dist_ft): dx_ft is signed (camera-left/right of rim
+    center); dist_ft is an unsigned rough distance along the camera's
+    vertical axis. Single fixed 2D camera, no perspective correction —
+    treat both as approximate, dx_ft more so trustworthy than dist_ft.
+    """
+    x, y, w, h = hoop_box
+    if w <= 0:
+        return 0.0, 0.0
+    px_per_ft = w / RIM_DIAMETER_FT
+    rim_cx, rim_bottom = x + w / 2, y + h
+    return (round((ball_x - rim_cx) / px_per_ft, 2),
+            round(abs(ball_y - rim_bottom) / px_per_ft, 2))
 
 
 @dataclass
@@ -294,6 +316,7 @@ class HoopShotDetector:
         self.state = "idle"
         self.armed_frame = None
         self.passed_through_band = False
+        self.last_x = None
         self.last_y = None
         self.last_y_frame = None
         self.cooldown_until = -1
@@ -339,15 +362,16 @@ class HoopShotDetector:
                 if below and kind == "measured":
                     result = "made" if self.passed_through_band else "miss"
                     conf = "high" if self.passed_through_band else "medium"
-                    event = self._resolve(frame_idx, result, conf)
+                    event = self._resolve(frame_idx, result, conf, x, y)
                 elif lateral and y < self.rim_top:
                     # Ball bounced up and away from the rim: miss.
-                    event = self._resolve(frame_idx, "miss", "high")
+                    event = self._resolve(frame_idx, "miss", "high", x, y)
                 elif frame_idx - self.armed_frame > self.make_confirm_frames:
                     # Timed out without a clean below-rim sighting.
                     result = "made" if self.passed_through_band else "miss"
-                    event = self._resolve(frame_idx, result, "medium")
+                    event = self._resolve(frame_idx, result, "medium", x, y)
 
+            self.last_x = x
             self.last_y = y
             self.last_y_frame = frame_idx
         else:
@@ -355,11 +379,14 @@ class HoopShotDetector:
             if self.state == "armed" and \
                     frame_idx - self.armed_frame > self.make_confirm_frames:
                 result = "made" if self.passed_through_band else "miss"
-                event = self._resolve(frame_idx, result, "medium")
+                event = self._resolve(frame_idx, result, "medium",
+                                      self.last_x, self.last_y)
 
         return event
 
-    def _resolve(self, frame_idx: int, result: str, confidence: str) -> ShotEvent:
+    def _resolve(self, frame_idx: int, result: str, confidence: str,
+                 ball_x: Optional[float] = None,
+                 ball_y: Optional[float] = None) -> ShotEvent:
         self.state = "idle"
         self.cooldown_until = frame_idx + self.cooldown_frames
         return ShotEvent(
@@ -367,6 +394,8 @@ class HoopShotDetector:
             time_s=frame_idx / self.fps,
             result=result,
             confidence=confidence,
+            ball_x=ball_x,
+            ball_y=ball_y,
         )
 
 
