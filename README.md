@@ -2,7 +2,7 @@
 
 Turn **any** basketball footage into highlight clips. Upload a video, draw one box around the rim in your browser, and get made/miss-classified clips back — with the original audio, cut frame-accurately.
 
-The structural difference from apps like Hooper: nothing has to be recorded inside an app. Old camcorder tape, a parent's phone video, a league's tripod footage — if it plays, HoopClip can process it.
+The structural difference from apps like Hooper: nothing has to be recorded inside an app. Old camcorder tape, phone video, a league's tripod footage — if it plays, HoopClip can process it.
 
 ## Quick start
 
