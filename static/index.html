@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HoopClip — turn any basketball footage into highlights</title>
+  <meta name="description" content="Upload any basketball video, mark the rim once, and get made/miss highlight clips automatically. No special app or camera required.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Barlow:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header>
+    <div class="header-inner">
+      <h1 class="wordmark">Hoop<span class="clip">Clip</span></h1>
+      <p class="tagline">Any footage. Your highlights. No special app, no special camera.</p>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ============ STEP 1: UPLOAD ============ -->
+    <section class="step" id="step-upload" aria-labelledby="h-upload">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">1</span>
+        <h2 id="h-upload">Upload your footage</h2>
+      </div>
+      <p class="step-sub">Game tape, practice video, an old phone recording — anything works.
+        MP4, MOV, AVI, MKV or WebM, up to 2&nbsp;GB.</p>
+
+      <div class="dropzone" id="dropzone">
+        <label class="btn-primary" for="fileInput" style="display:inline-block">Choose a video</label>
+        <input type="file" id="fileInput"
+               accept="video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,video/webm,.mp4,.mov,.avi,.mkv,.webm,.m4v"
+               aria-describedby="upload-hint">
+        <p id="upload-hint">or drag and drop it here</p>
+        <div class="file-meta" id="fileMeta" aria-live="polite"></div>
+      </div>
+
+      <div class="progress-track" id="uploadTrack" hidden>
+        <div class="progress-fill" id="uploadFill"></div>
+      </div>
+      <p class="status-line" id="uploadStatus" role="status" aria-live="polite"></p>
+      <div class="alert" id="uploadError" role="alert"></div>
+    </section>
+
+    <!-- ============ STEP 2: MARK THE RIM ============ -->
+    <section class="step" id="step-rim" aria-labelledby="h-rim" aria-disabled="true">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">2</span>
+        <h2 id="h-rim">Mark the rim</h2>
+      </div>
+      <p class="step-sub">Scrub to a frame where the rim is clearly visible, then draw a tight box
+        around it. A tight box is the single biggest accuracy lever.</p>
+
+      <div class="scrub-row">
+        <label for="frameScrub">Frame</label>
+        <input type="range" id="frameScrub" min="0" max="0" step="0.1" value="0"
+               aria-describedby="scrubTime">
+        <span class="timecode" id="scrubTime">0:00</span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="rimCanvas" tabindex="0"
+                role="application"
+                aria-label="Rim marking canvas. Drag with the mouse to draw a box around the rim. With the keyboard: arrow keys move the box, Shift plus arrow keys resize it, Delete clears it. You can also type exact pixel values in the fields below the canvas."
+                aria-describedby="rimStatus"></canvas>
+      </div>
+
+      <p class="status-line" id="rimStatus" role="status" aria-live="polite">No rim box yet — drag on the frame to draw one.</p>
+
+      <p class="hint">Keyboard: <kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> move ·
+        <kbd>Shift</kbd>+arrows resize · <kbd>Delete</kbd> clear.
+        Or set exact pixel values:</p>
+
+      <div class="box-fields">
+        <div><label for="boxX">X (px)</label><input type="number" id="boxX" min="0" step="1"></div>
+        <div><label for="boxY">Y (px)</label><input type="number" id="boxY" min="0" step="1"></div>
+        <div><label for="boxW">Width (px)</label><input type="number" id="boxW" min="4" step="1"></div>
+        <div><label for="boxH">Height (px)</label><input type="number" id="boxH" min="4" step="1"></div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 3: SETTINGS + RUN ============ -->
+    <section class="step" id="step-run" aria-labelledby="h-run" aria-disabled="true">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">3</span>
+        <h2 id="h-run">Choose what to clip</h2>
+      </div>
+
+      <fieldset>
+        <legend>Which shots?</legend>
+        <div class="radio-row">
+          <label><input type="radio" name="mode" value="made"> Made baskets only</label>
+          <label><input type="radio" name="mode" value="miss"> Missed shots only</label>
+          <label><input type="radio" name="mode" value="all" checked> Every attempt</label>
+        </div>
+      </fieldset>
+
+      <div class="field-row">
+        <div>
+          <label for="beforeS">Seconds before the shot</label>
+          <input type="number" id="beforeS" min="0" max="30" step="0.5" value="3">
+          <span class="hint">Captures the move that set it up</span>
+        </div>
+        <div>
+          <label for="afterS">Seconds after the shot</label>
+          <input type="number" id="afterS" min="0" max="30" step="0.5" value="1">
+          <span class="hint">Captures the reaction</span>
+        </div>
+      </div>
+
+      <p style="margin-top:1.5rem">
+        <button class="btn-primary" id="startBtn">Find my highlights</button>
+        <button class="btn-ghost" id="cancelBtn" hidden>Cancel</button>
+      </p>
+
+      <div class="progress-track" id="jobTrack" hidden>
+        <div class="progress-fill" id="jobFill" role="progressbar"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+             aria-label="Processing progress"></div>
+      </div>
+      <p class="status-line" id="jobStatus" role="status" aria-live="polite"></p>
+      <ul class="event-feed" id="eventFeed" aria-label="Shots detected so far"></ul>
+      <div class="alert" id="jobError" role="alert"></div>
+    </section>
+
+    <!-- ============ STEP 4: RESULTS ============ -->
+    <section class="step" id="step-results" aria-labelledby="h-results" aria-disabled="true">
+      <div class="step-head">
+        <span class="step-num" aria-hidden="true">4</span>
+        <h2 id="h-results">Your highlights</h2>
+      </div>
+      <p class="step-sub" id="resultsSummary"></p>
+
+      <div class="timeline" id="timeline" role="group" aria-label="Shot timeline. Each marker is a detected shot; activate one to jump to its clip."></div>
+      <div class="timeline-caption"><span>0:00</span><span id="timelineEnd">—</span></div>
+
+      <div class="clip-grid" id="clipGrid"></div>
+
+      <div class="results-actions">
+        <a class="btn-primary" id="zipLink" href="#" download hidden>Download all clips (.zip)</a>
+        <button class="btn-ghost" id="restartBtn" hidden>Process another video</button>
+      </div>
+
+      <p class="note">Made/miss calls come from a single camera angle, so borderline
+        rim-rattlers can be misread — clips tagged <em>medium</em> confidence are the ones
+        worth a second look. A tighter rim box and steadier footage both raise accuracy.</p>
+    </section>
+
+  </main>
+
+  <footer>
+    HoopClip runs on your own footage — nothing has to be recorded inside an app.
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+*.pt
