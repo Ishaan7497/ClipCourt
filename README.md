@@ -1,4 +1,4 @@
-# HoopClip
+# ClipCourt
 
 Turn **any** basketball footage into highlight clips. Upload a video, draw one box around the rim in your browser, and get made/miss-classified clips back — with the original audio, cut frame-accurately.
 
