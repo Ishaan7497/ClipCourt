@@ -19,7 +19,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine import BallTracker, EngineConfig, HoopShotDetector
+from engine import (BallTracker, EngineConfig, HoopShotDetector,
+                    approx_shot_location_ft)
 
 FRAME_W, FRAME_H = 1280, 720
 FPS = 30.0
@@ -58,6 +59,7 @@ def test_clean_swish_is_made():
     events = run_trajectory(pts)
     assert len(events) == 1, f"expected 1 event, got {len(events)}"
     assert events[0].result == "made", events[0]
+    assert events[0].ball_x is not None and events[0].ball_y is not None, events[0]
 
 
 def test_front_rim_brick_is_miss():
@@ -91,6 +93,29 @@ def test_velocity_not_inflated_across_gap():
     # 5-frame gap, ball moved 50px total => 10 px/frame, NOT 50.
     tracker.update([(150, 100, 24, 24, 0.9)], 5)
     assert abs(tracker.velocity[0] - 10.0) < 1e-6, tracker.velocity
+
+
+def test_track_lost_resolution_uses_last_known_position():
+    # Ball descends into the zone, then the track is lost entirely — the
+    # detector resolves on timeout via the point-is-None branch, which must
+    # fall back to the last measured position rather than emit None coords.
+    rim_cx = 640
+    down = arc(rim_cx - 20, 60, rim_cx, 195, 16)  # armed, still above the rim
+    events = run_trajectory(down)                  # harness pads with None frames
+    assert len(events) == 1, f"expected 1 event, got {len(events)}"
+    assert events[0].confidence == "medium", events[0]
+    assert events[0].ball_x is not None and events[0].ball_y is not None, events[0]
+
+
+def test_approx_shot_location_scale():
+    # HOOP is 80 px wide = 1.5 ft rim, so 53.33 px/ft; rim center x = 640.
+    dx, dist = approx_shot_location_ft(640, HOOP[1] + HOOP[3], HOOP)
+    assert abs(dx) < 1e-6 and abs(dist) < 1e-6, (dx, dist)
+    dx, dist = approx_shot_location_ft(640 + 80 / 1.5, 230 + 80 / 1.5, HOOP)
+    assert abs(dx - 1.0) < 0.01, dx
+    assert abs(dist - 1.0) < 0.01, dist
+    # Degenerate rim box must not divide by zero.
+    assert approx_shot_location_ft(100, 100, (0, 0, 0, 0)) == (0.0, 0.0)
 
 
 def test_cooldown_suppresses_rebound_double_trigger():

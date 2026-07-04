@@ -117,7 +117,7 @@ main {
 .step[aria-disabled="true"] {
   opacity: 0.45;
 }
-.step[aria-disabled="true"] :is(button, input, canvas, a) {
+.step[aria-disabled="true"] :is(button, input, canvas, a, select) {
   pointer-events: none;
 }
 
@@ -196,6 +196,25 @@ input[type="number"] {
   border-radius: 6px;
   padding: 0.4rem 0.5rem;
   width: 6.5rem;
+}
+
+input[type="text"], select {
+  font: inherit;
+  background: var(--court-sunken);
+  color: var(--chalk);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+select { cursor: pointer; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 fieldset {
@@ -429,6 +448,212 @@ kbd {
   flex-wrap: wrap;
   align-items: center;
   margin-top: 1.5rem;
+}
+
+/* ---------- Coaching: roster + shot chart + stats ---------- */
+
+.coaching-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) 1fr;
+  gap: 1.25rem;
+  align-items: start;
+  margin-bottom: 1.5rem;
+}
+
+.roster-panel, .court-panel, .stats-panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--court-sunken);
+  padding: 1rem 1.1rem 1.1rem;
+}
+
+.roster-panel h3, .court-panel h3, .stats-panel h3 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+  color: var(--tape);
+}
+
+.roster-add {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+.roster-add input { flex: 1; min-width: 0; }
+.btn-small { padding: 0.4rem 0.9rem; font-size: 0.95rem; }
+
+.roster-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.roster-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.4rem 0.1rem;
+  border-bottom: 1px dashed var(--line);
+}
+.roster-list li.roster-empty {
+  color: var(--chalk-dim);
+  font-size: 0.9rem;
+  border-bottom: none;
+}
+.roster-name { flex: 1; font-weight: 600; overflow-wrap: anywhere; }
+.roster-remove {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--chalk-dim);
+  border-radius: 6px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+.roster-remove:hover { border-color: var(--miss); color: var(--miss); }
+
+.swatch {
+  display: inline-block;
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 50%;
+  flex: none;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+}
+
+/* Court diagram: baseline at the top, hoop up top like a scouting chart. */
+.court-diagram {
+  position: relative;
+  aspect-ratio: 50 / 47;
+  background: var(--court);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.court-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.shot-marker {
+  position: absolute;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0;
+  border: 3px solid var(--court);
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+.shot-marker:hover, .shot-marker:focus-visible {
+  transform: translate(-50%, -50%) scale(1.35);
+  z-index: 2;
+}
+.shot-marker.made { background: var(--make); }
+.shot-marker.miss { background: var(--miss); }
+
+.court-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  font-size: 0.9rem;
+  color: var(--chalk-dim);
+}
+.court-legend li { display: flex; align-items: center; gap: 0.4rem; }
+.legend-swatch {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  flex: none;
+}
+.legend-swatch.made { background: var(--make); }
+.legend-swatch.miss { background: var(--miss); }
+.legend-swatch.ring { background: transparent; border: 3px solid var(--line); }
+
+.export-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+.export-actions a {
+  text-decoration: none;
+  padding: 0.55rem 1.1rem;
+  border-radius: var(--radius);
+  font-weight: 600;
+}
+
+.stats-panel { margin-bottom: 1.5rem; }
+.stats-dash {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+  gap: 0.9rem;
+}
+.stat-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--court);
+  padding: 0.75rem 0.9rem 0.85rem;
+}
+.stat-card.team { border-color: var(--leather); }
+.stat-card h4 {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.stat-pct {
+  font-family: var(--font-display);
+  font-size: 2rem;
+  line-height: 1.1;
+  color: var(--leather);
+  margin: 0;
+}
+.stat-card.team .stat-pct { color: var(--tape); }
+.stat-detail {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: var(--chalk-dim);
+}
+.stat-loc { font-family: var(--font-mono); font-size: 0.8rem; }
+
+.assign-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding-top: 0.55rem;
+  border-top: 1px dashed var(--line);
+}
+.assign-row .assign-time {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--chalk-dim);
+  min-width: 6ch;
+}
+.assign-row select {
+  flex: 1;
+  min-width: 7.5rem;
+  font-size: 0.88rem;
+  padding: 0.3rem 0.4rem;
+}
+
+.drill-filter { margin-top: 0.25rem; }
+
+@media (max-width: 720px) {
+  .coaching-grid { grid-template-columns: 1fr; }
 }
 
 /* ---------- Alerts ---------- */

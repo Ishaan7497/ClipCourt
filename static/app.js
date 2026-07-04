@@ -12,6 +12,8 @@ const state = {
   box: null,          // {x,y,w,h} in PREVIEW pixel space
   job: null,
   pollTimer: null,
+  roster: [],         // players from GET /api/videos/{id}/roster
+  drillFilter: "all",
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -383,7 +385,8 @@ function renderJob(job) {
 
 /* ---------------------------------------------------------------- results */
 
-function showResults(job) {
+async function showResults(job) {
+  state.job = job;
   setStepEnabled("step-results", true);
   const dur = state.video.duration_s || 1;
   const made = job.events.filter((e) => e.result === "made").length;
@@ -392,36 +395,29 @@ function showResults(job) {
     `${job.events.length} shot${job.events.length === 1 ? "" : "s"} detected ` +
     `(${made} made, ${miss} missed) — ${job.clips.length} clip${job.clips.length === 1 ? "" : "s"} cut.`;
 
+  await loadRoster();
+
   // Timeline strip
   const tl = $("timeline");
   tl.innerHTML = "";
   $("timelineEnd").textContent = fmtTime(dur);
-  job.events.forEach((ev, i) => {
+  job.events.forEach((ev) => {
     const tick = document.createElement("button");
     tick.className = `tick ${ev.result}`;
     tick.style.left = (ev.time_s / dur) * 100 + "%";
     tick.setAttribute("aria-label",
       `${ev.result === "made" ? "Made basket" : "Missed shot"} at ${fmtTime(ev.time_s)}. Jump to clip.`);
-    tick.addEventListener("click", () => {
-      const card = document.querySelector(`[data-clip-for="${i}"]`);
-      if (card) {
-        card.scrollIntoView({ behavior: "smooth", block: "center" });
-        card.querySelector("video").focus();
-      }
-    });
+    tick.addEventListener("click", () => focusShot(ev.frame, "video"));
     tl.appendChild(tick);
   });
 
-  // Clip cards
+  // Clip cards (with per-shot player/drill pickers)
   const grid = $("clipGrid");
   grid.innerHTML = "";
   job.clips.forEach((clip) => {
     const url = `/api/jobs/${job.id}/clips/${encodeURIComponent(clip.file)}`;
     const card = document.createElement("article");
     card.className = "clip-card";
-    const eventIdx = job.events.findIndex((e) =>
-      clip.events.some((ce) => ce.frame === e.frame));
-    if (eventIdx >= 0) card.dataset.clipFor = String(eventIdx);
 
     const badges = clip.events
       .map((e) => `<span class="badge ${e.result}">${e.result}</span>`)
@@ -434,8 +430,26 @@ function showResults(job) {
          <div class="badges">${badges}</div>
          <a class="download" href="${url}" download>Download clip</a>
        </div>`;
+
+    const body = card.querySelector(".clip-body");
+    const download = body.querySelector("a.download");
+    clip.events.forEach((ce) => {
+      const ev = job.events.find((e) => e.frame === ce.frame);
+      if (ev) body.insertBefore(assignmentRow(ev), download);
+    });
     grid.appendChild(card);
   });
+
+  renderCourtDiagram(job);
+  renderStats(job);
+
+  const csv = $("csvLink");
+  const pdf = $("pdfLink");
+  csv.hidden = pdf.hidden = !job.events.length;
+  if (job.events.length) {
+    csv.href = `/api/jobs/${job.id}/export.csv`;
+    pdf.href = `/api/jobs/${job.id}/export.pdf`;
+  }
 
   const zip = $("zipLink");
   if (job.clips.length) {
@@ -445,4 +459,416 @@ function showResults(job) {
     zip.hidden = true;
   }
   $("restartBtn").hidden = false;
+}
+
+/* --------------------------------------------------------------- coaching */
+
+const DRILL_LABELS = {
+  layups: "Layups",
+  three_pointers: "3-Pointers",
+  midrange: "Mid-range",
+};
+const COURT_HOOP_Y = 5.25; // hoop center, feet from the baseline (matches the SVG)
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function playerById(id) {
+  return state.roster.find((p) => p.id === id) || null;
+}
+
+function playerLabel(id) {
+  if (!id) return "Unassigned";
+  const p = playerById(id);
+  return p ? p.name : "(removed player)";
+}
+
+/* ----- roster ----- */
+
+async function loadRoster() {
+  try {
+    const res = await fetch(`/api/videos/${state.video.id}/roster`);
+    if (!res.ok) throw new Error(await apiError(res));
+    state.roster = (await res.json()).players || [];
+  } catch (err) {
+    $("rosterStatus").textContent = `Couldn't load the roster — ${err.message}`;
+    state.roster = [];
+  }
+  renderRoster();
+}
+
+function renderRoster() {
+  const list = $("rosterList");
+  list.innerHTML = "";
+  state.roster.forEach((p) => {
+    const li = document.createElement("li");
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = p.color;
+    swatch.setAttribute("aria-hidden", "true");
+    const name = document.createElement("span");
+    name.className = "roster-name";
+    name.textContent = p.name;
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "roster-remove";
+    rm.textContent = "✕";
+    rm.setAttribute("aria-label", `Remove ${p.name} from the roster`);
+    rm.addEventListener("click", () => removePlayer(p));
+    li.append(swatch, name, rm);
+    list.appendChild(li);
+  });
+  if (!state.roster.length) {
+    const li = document.createElement("li");
+    li.className = "roster-empty";
+    li.textContent = "No players yet — add one above to start tagging shots.";
+    list.appendChild(li);
+  }
+  refreshPlayerSelects();
+  renderLegend();
+}
+
+async function addPlayer() {
+  const input = $("playerName");
+  const name = input.value.trim();
+  if (!name) {
+    $("rosterStatus").textContent = "Type a player name first.";
+    input.focus();
+    return;
+  }
+  const res = await fetch(`/api/videos/${state.video.id}/roster`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    $("rosterStatus").textContent = await apiError(res);
+    return;
+  }
+  const player = await res.json();
+  state.roster.push(player);
+  input.value = "";
+  input.focus();
+  renderRoster();
+  if (state.job) renderStats(state.job);
+  $("rosterStatus").textContent = `${player.name} added to the roster.`;
+}
+
+async function removePlayer(player) {
+  const res = await fetch(
+    `/api/videos/${state.video.id}/roster/${player.id}`, { method: "DELETE" });
+  if (!res.ok) {
+    $("rosterStatus").textContent = await apiError(res);
+    return;
+  }
+  state.roster = state.roster.filter((p) => p.id !== player.id);
+  renderRoster();
+  if (state.job) {
+    renderCourtDiagram(state.job);
+    renderStats(state.job);
+  }
+  $("rosterStatus").textContent =
+    `${player.name} removed. Shots tagged to them now show as "(removed player)".`;
+}
+
+$("addPlayerBtn").addEventListener("click", addPlayer);
+$("playerName").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    addPlayer();
+  }
+});
+
+/* ----- per-shot assignment ----- */
+
+function fillPlayerOptions(sel, current) {
+  sel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "Unassigned";
+  sel.appendChild(none);
+  state.roster.forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = p.name;
+    sel.appendChild(o);
+  });
+  if (current && !state.roster.some((p) => p.id === current)) {
+    const o = document.createElement("option");
+    o.value = current;
+    o.textContent = "(removed player)";
+    sel.appendChild(o);
+  }
+  sel.value = current || "";
+}
+
+function refreshPlayerSelects() {
+  document.querySelectorAll('select[data-kind="player"]')
+    .forEach((sel) => fillPlayerOptions(sel, sel.value));
+}
+
+function assignmentRow(ev) {
+  const row = document.createElement("div");
+  row.className = "assign-row";
+  row.dataset.frame = String(ev.frame);
+
+  const time = document.createElement("span");
+  time.className = "assign-time";
+  time.textContent = `${fmtTime(ev.time_s)} ${ev.result}`;
+
+  const playerSel = document.createElement("select");
+  playerSel.dataset.kind = "player";
+  playerSel.setAttribute("aria-label",
+    `Player for the ${ev.result} at ${fmtTime(ev.time_s)}`);
+  fillPlayerOptions(playerSel, ev.player_id || "");
+
+  const drillSel = document.createElement("select");
+  drillSel.dataset.kind = "drill";
+  drillSel.setAttribute("aria-label",
+    `Drill type for the ${ev.result} at ${fmtTime(ev.time_s)}`);
+  const noDrill = document.createElement("option");
+  noDrill.value = "";
+  noDrill.textContent = "No drill";
+  drillSel.appendChild(noDrill);
+  Object.entries(DRILL_LABELS).forEach(([value, label]) => {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    drillSel.appendChild(o);
+  });
+  drillSel.value = ev.drill_tag || "";
+
+  const onChange = () =>
+    assignShot(ev.frame, playerSel.value || null, drillSel.value || null);
+  playerSel.addEventListener("change", onChange);
+  drillSel.addEventListener("change", onChange);
+
+  row.append(time, playerSel, drillSel);
+  return row;
+}
+
+async function assignShot(frame, playerId, drillTag) {
+  const ev = state.job.events.find((e) => e.frame === frame);
+  const res = await fetch(`/api/jobs/${state.job.id}/shots/${frame}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ player_id: playerId, drill_tag: drillTag }),
+  });
+  if (!res.ok) {
+    $("assignStatus").textContent =
+      `Couldn't save that tag — ${await apiError(res)}`;
+    const row = document.querySelector(`.assign-row[data-frame="${frame}"]`);
+    if (row && ev) {
+      fillPlayerOptions(row.querySelector('select[data-kind="player"]'), ev.player_id || "");
+      row.querySelector('select[data-kind="drill"]').value = ev.drill_tag || "";
+    }
+    return;
+  }
+  const saved = await res.json();
+  if (ev) {
+    ev.player_id = saved.player_id;
+    ev.drill_tag = saved.drill_tag;
+  }
+  renderCourtDiagram(state.job);
+  renderStats(state.job);
+  $("assignStatus").textContent =
+    `${fmtTime(ev.time_s)} ${ev.result} tagged: ${playerLabel(saved.player_id)}` +
+    (saved.drill_tag ? `, ${DRILL_LABELS[saved.drill_tag]}` : "") + ".";
+}
+
+function focusShot(frame, target) {
+  const row = document.querySelector(`.assign-row[data-frame="${frame}"]`);
+  const card = row && row.closest(".clip-card");
+  if (!card) {
+    $("courtStatus").textContent =
+      "No clip was cut for this shot (it may be filtered out by the clip mode).";
+    return;
+  }
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (target === "player") {
+    row.querySelector('select[data-kind="player"]').focus({ preventScroll: true });
+  } else {
+    card.querySelector("video").focus({ preventScroll: true });
+  }
+}
+
+/* ----- court diagram ----- */
+
+function courtPct(xFt, distFt) {
+  const cx = Math.max(-24, Math.min(24, xFt));
+  const cy = Math.max(0, Math.min(41, distFt));
+  return {
+    left: ((25 + cx) / 50) * 100,
+    top: ((COURT_HOOP_Y + cy) / 47) * 100,
+  };
+}
+
+function shotLabel(ev, idx) {
+  let label = `Shot ${idx + 1}: ${ev.result === "made" ? "made" : "missed"} ` +
+    `at ${fmtTime(ev.time_s)}, ${playerLabel(ev.player_id)}`;
+  if (ev.drill_tag) label += `, ${DRILL_LABELS[ev.drill_tag]}`;
+  return label;
+}
+
+function renderCourtDiagram(job) {
+  const wrap = $("courtDiagram");
+  wrap.querySelectorAll(".shot-marker").forEach((n) => n.remove());
+  let placed = 0;
+  job.events.forEach((ev, i) => {
+    if (ev.court_x_ft == null || ev.court_dist_ft == null) return;
+    placed += 1;
+    const { left, top } = courtPct(ev.court_x_ft, ev.court_dist_ft);
+    const marker = document.createElement("button");
+    marker.type = "button";
+    marker.className = `shot-marker ${ev.result}`;
+    marker.dataset.frame = String(ev.frame);
+    marker.dataset.drill = ev.drill_tag || "";
+    marker.style.left = left + "%";
+    marker.style.top = top + "%";
+    const p = playerById(ev.player_id);
+    if (p) marker.style.borderColor = p.color;
+    marker.setAttribute("aria-label", shotLabel(ev, i) + ". Activate to tag this shot.");
+    const announce = () => { $("courtStatus").textContent = shotLabel(ev, i); };
+    marker.addEventListener("focus", announce);
+    marker.addEventListener("mouseenter", announce);
+    marker.addEventListener("click", () => focusShot(ev.frame, "player"));
+    wrap.appendChild(marker);
+  });
+  if (!placed) {
+    $("courtStatus").textContent = job.events.length
+      ? "No location data for these shots — the chart fills in for videos analyzed from now on."
+      : "No shots detected.";
+  }
+  applyDrillFilter();
+}
+
+function renderLegend() {
+  $("courtLegend").innerHTML =
+    '<li><span class="legend-swatch made" aria-hidden="true"></span> Made</li>' +
+    '<li><span class="legend-swatch miss" aria-hidden="true"></span> Missed</li>' +
+    state.roster.map((p) =>
+      `<li><span class="legend-swatch ring" style="border-color:${esc(p.color)}" ` +
+      `aria-hidden="true"></span> ${esc(p.name)}</li>`).join("");
+}
+
+/* ----- stats dashboard ----- */
+
+function locationBucket(ev) {
+  if (ev.court_x_ft == null || ev.court_dist_ft == null) return null;
+  const d = Math.hypot(ev.court_x_ft, ev.court_dist_ft);
+  return d < 8 ? "close" : d <= 20 ? "mid" : "deep";
+}
+
+function tally(evs) {
+  const made = evs.filter((e) => e.result === "made").length;
+  return {
+    att: evs.length,
+    made,
+    pct: evs.length ? Math.round((100 * made) / evs.length) : null,
+  };
+}
+
+function statCard(title, evs, color) {
+  const { att, made, pct } = tally(evs);
+  const card = document.createElement("article");
+  card.className = "stat-card";
+  const h = document.createElement("h4");
+  if (color) {
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = color;
+    sw.setAttribute("aria-hidden", "true");
+    h.appendChild(sw);
+  }
+  h.appendChild(document.createTextNode(title));
+  const big = document.createElement("p");
+  big.className = "stat-pct";
+  big.textContent = pct == null ? "—" : pct + "%";
+  const detail = document.createElement("p");
+  detail.className = "stat-detail";
+  detail.textContent =
+    `${made} made / ${att - made} missed (${att} shot${att === 1 ? "" : "s"})`;
+  card.append(h, big, detail);
+
+  const buckets = { close: [], mid: [], deep: [] };
+  let anyLocated = false;
+  evs.forEach((e) => {
+    const b = locationBucket(e);
+    if (b) {
+      buckets[b].push(e);
+      anyLocated = true;
+    }
+  });
+  if (anyLocated) {
+    const loc = document.createElement("p");
+    loc.className = "stat-detail stat-loc";
+    loc.textContent = ["close", "mid", "deep"].map((b) => {
+      const t = tally(buckets[b]);
+      return `${b[0].toUpperCase()}${b.slice(1)} ${t.made}/${t.att}`;
+    }).join(" · ");
+    card.appendChild(loc);
+  }
+  return card;
+}
+
+function renderStats(job) {
+  const dash = $("statsDash");
+  dash.innerHTML = "";
+  if (!job.events.length) {
+    dash.innerHTML = '<p class="hint">Stats appear once shots are detected.</p>';
+    return;
+  }
+  const groups = new Map(); // player_id (or "") -> events
+  job.events.forEach((ev) => {
+    const key = ev.player_id || "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(ev);
+  });
+  state.roster.forEach((p) => {
+    const evs = groups.get(p.id);
+    if (evs) dash.appendChild(statCard(p.name, evs, p.color));
+  });
+  groups.forEach((evs, key) => {
+    if (key && !playerById(key)) dash.appendChild(statCard("(removed player)", evs, null));
+  });
+  if (groups.has("")) dash.appendChild(statCard("Unassigned", groups.get(""), null));
+  const team = statCard("Team", job.events, null);
+  team.classList.add("team");
+  dash.appendChild(team);
+}
+
+/* ----- drill filter ----- */
+
+document.querySelectorAll('input[name="drill"]').forEach((radio) =>
+  radio.addEventListener("change", () => {
+    state.drillFilter = radio.value;
+    applyDrillFilter();
+  })
+);
+
+function applyDrillFilter() {
+  const tag = state.drillFilter || "all";
+  document.querySelectorAll(".shot-marker").forEach((m) => {
+    m.hidden = tag !== "all" && m.dataset.drill !== tag;
+  });
+  const events = state.job ? state.job.events : [];
+  document.querySelectorAll(".clip-card").forEach((card) => {
+    const frames = [...card.querySelectorAll(".assign-row")]
+      .map((r) => Number(r.dataset.frame));
+    const match = tag === "all" ||
+      events.some((e) => frames.includes(e.frame) && e.drill_tag === tag);
+    card.hidden = !match;
+  });
+  if (tag === "all") {
+    $("drillStats").textContent = "";
+    return;
+  }
+  const evs = events.filter((e) => e.drill_tag === tag);
+  const { att, made, pct } = tally(evs);
+  $("drillStats").textContent = att
+    ? `${DRILL_LABELS[tag]}: ${att} shot${att === 1 ? "" : "s"}, ${made} made (${pct}%).`
+    : `${DRILL_LABELS[tag]}: no shots tagged yet.`;
 }
