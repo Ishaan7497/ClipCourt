@@ -1,0 +1,15 @@
+[
+  {
+    "file": "clip_01_miss_00m02s.mp4",
+    "start_s": 2.67,
+    "end_s": 6.67,
+    "events": [
+      {
+        "frame": 136,
+        "time_s": 5.666666666666667,
+        "result": "miss",
+        "confidence": "medium"
+      }
+    ]
+  }
+]
