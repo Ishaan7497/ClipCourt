@@ -1,5 +1,5 @@
 """
-Synthetic trajectory test harness for the HoopClip detection logic.
+Synthetic trajectory test harness for the ClipCourt detection logic.
 
 No video, no YOLO — we synthesize ball detections frame-by-frame and assert
 that BallTracker + HoopShotDetector classify them correctly. This pins down
@@ -19,8 +19,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import cv2
+import numpy as np
+
 from engine import (BallTracker, EngineConfig, HoopShotDetector,
-                    approx_shot_location_ft)
+                    _rim_candidates, approx_shot_location_ft, device_label,
+                    resolve_device, vertical_crop_window)
 
 FRAME_W, FRAME_H = 1280, 720
 FPS = 30.0
@@ -126,6 +130,49 @@ def test_cooldown_suppresses_rebound_double_trigger():
     rebound = arc(rim_cx, 320, rim_cx - 10, 120, 10) + arc(rim_cx - 10, 120, rim_cx, 320, 10)
     events = run_trajectory(shot + rebound)
     assert len(events) == 1, f"cooldown failed: got {len(events)} events"
+
+
+def test_vertical_crop_is_nine_sixteenths_and_inside_the_frame():
+    # Landscape source: keep full height, crop width to 9:16.
+    w, h, x, y = vertical_crop_window(1920, 1080, center_x=960)
+    assert (w, h) == (608, 1080), (w, h)   # 1080 * 9/16 = 607.5, rounded even
+    assert abs((w / h) - 9 / 16) < 0.01
+    assert x == (1920 - w) // 2 and y == 0
+
+    # Centering on the action, clamped so the window stays in frame.
+    _w, _h, x_left, _y = vertical_crop_window(1920, 1080, center_x=0)
+    _w, _h, x_right, _y = vertical_crop_window(1920, 1080, center_x=1920)
+    assert x_left == 0, x_left
+    assert x_right == 1920 - _w, x_right
+
+    # Already-portrait source must not be cropped to nothing.
+    w, h, x, y = vertical_crop_window(1080, 1920, center_x=540)
+    assert (w, h) == (1080, 1920) and (x, y) == (0, 0)
+
+    # Odd dimensions get rounded down to even (libx264 + yuv420p).
+    w, h, _x, _y = vertical_crop_window(1921, 1081, center_x=500)
+    assert w % 2 == 0 and h % 2 == 0, (w, h)
+
+
+def test_rim_candidate_prefers_the_hollow_wide_rim_over_the_ball():
+    # An orange ring (rim) at the top and a solid orange disc (ball) below it.
+    frame = np.zeros((480, 640, 3), np.uint8)
+    orange = (20, 110, 230)  # BGR
+    cv2.ellipse(frame, (300, 120), (45, 12), 0, 0, 360, orange, 3)  # hollow, wide
+    cv2.circle(frame, (300, 300), 22, orange, -1)                   # solid, round
+
+    cands = _rim_candidates(frame)
+    assert cands, "expected at least the rim to be found"
+    _score, x, y, w, h = cands[0]
+    assert w / h > 1.2, f"best candidate should be wide, got {w}x{h}"
+    assert y < 200, f"best candidate should be the upper ring, got y={y}"
+
+
+def test_device_resolution_is_a_known_backend():
+    dev = resolve_device()
+    assert dev in ("cuda", "mps", "cpu"), dev
+    assert device_label(dev) in ("NVIDIA GPU", "Apple GPU", "CPU")
+    assert resolve_device() == dev, "device choice should be cached"
 
 
 if __name__ == "__main__":
