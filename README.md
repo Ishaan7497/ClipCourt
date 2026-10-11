@@ -19,12 +19,14 @@ The first job downloads the YOLOv8s weights (~22 MB) automatically. `ffmpeg` on 
 ```
 browser                          server                         engine
 ─────────                        ──────                         ──────
-upload video ──────────────────▶ POST /api/videos ────────────▶ probe + validate
+upload video(s) ───────────────▶ POST /api/videos ────────────▶ probe + validate
 scrub & draw rim box ──────────▶ GET  /videos/{id}/frame        extract JPEG frame
+  (or auto-suggest it) ────────▶ GET  /videos/{id}/suggest-rim  colour+shape scan
 "Find my highlights" ──────────▶ POST /api/jobs ──────────────▶ worker thread:
 poll every second ─────────────▶ GET  /api/jobs/{id}              YOLO → BallTracker
                                                                   → HoopShotDetector
 watch clips / download zip ────▶ GET  /jobs/{id}/clips[.zip] ◀─── ffmpeg clip pass
+reopen an earlier session ─────▶ GET  /api/videos ◀──────────────  job/video sidecars
 ```
 
 **Detection pipeline** (in `engine.py`):
@@ -33,6 +35,33 @@ watch clips / download zip ────▶ GET  /jobs/{id}/clips[.zip] ◀──
 2. **BallTracker** picks the candidate that best continues the trajectory (confidence minus distance penalty), EMA-smooths positions, and *coasts* through short occlusions with a velocity computed over the real frame gap.
 3. **HoopShotDetector** arms when a descending ball enters the attempt zone, and calls **MADE** only if the ball was *measured* descending through the rim band before being seen below it — a front-of-rim brick that drops below rim level is a **MISS**. A cooldown suppresses rebound double-triggers, and direction is never inferred across a stale gap (`direction_gap_frames`).
 4. **Clipping** merges overlapping shot windows and cuts each with a frame-accurate ffmpeg re-encode (audio preserved). No `cap.set()` keyframe drift in either path.
+
+## Batch, speed and output
+
+- **Queue several videos at once.** Pick or drop multiple files; they upload
+  one at a time (parallel 2 GB uploads only starve each other) and land in a
+  queue. Select any one to mark its rim or re-open its clips. *Run every
+  marked video* starts them all — the worker pool decides how many run
+  concurrently.
+- **Rim auto-suggest.** *Suggest rim automatically* scans a handful of frames
+  for something rim-shaped: wide, hollow and in the same place every frame
+  (a basketball is the same colour but round, solid and moving). It is a
+  starting point you confirm — when it isn't sure it says so instead of
+  guessing.
+- **Copy a rim box across videos.** *Apply this box to matching videos* copies
+  the box to every queued video with the same frame size. Different frame
+  sizes are skipped, since pixel coordinates wouldn't mean the same thing.
+- **GPU acceleration.** Inference runs on CUDA or Apple MPS when available,
+  CPU otherwise, and frames go through YOLO in batches so a GPU isn't idling
+  between round trips. The device is named in the progress line and recorded
+  on the finished job. Force one with `CLIPCOURT_DEVICE=cpu`.
+- **Vertical 9:16 export.** Optionally cut a second copy of every clip,
+  cropped around the ball for phones and social, alongside the full-frame one.
+- **Sessions survive restarts.** Videos and jobs are written to JSON sidecars
+  next to the footage and reloaded on boot, so finished clips, player tags and
+  shot charts are still there after a reload — or after the server restarts.
+  A job interrupted mid-run is restored as a failure you can re-run, not as a
+  job that silently hangs forever.
 
 ## Coaching features
 
@@ -57,10 +86,21 @@ Made/miss classification from a single 2D camera angle has an accuracy ceiling �
 ## Tests
 
 ```bash
-python tests/test_detector.py     # or: python -m pytest tests/ -q
+python -m pytest tests/ -q
+# or run a file directly, no pytest required:
+python tests/test_detector.py
+python tests/test_export.py
+python tests/test_server.py
 ```
 
-Synthetic trajectory harness — no video or YOLO needed. Covers the clean swish, the front-rim brick, the occluded swish, velocity across detection gaps, and rebound cooldown.
+No video fixtures, no YOLO weights, no network, and no test-only dependencies
+— each file also runs standalone with a plain `python`.
+
+| File | Covers |
+|---|---|
+| `test_detector.py` | Synthetic trajectories: clean swish, front-rim brick, occluded swish, velocity across detection gaps, rebound cooldown, 9:16 crop geometry, rim-vs-ball shape scoring, device resolution. |
+| `test_export.py` | CSV rows and escaping, per-player/team stat tallies, removed-player fallbacks, real PDF generation (skips cleanly if matplotlib/reportlab are absent). |
+| `test_server.py` | Persistence round-trip and restart recovery, legacy-directory adoption, corrupt-sidecar tolerance, roster CRUD, shot-tagging guards (409/404/422), clip-path traversal rejection, export guards, zip contents, rim suggestion on a generated video. |
 
 ## Tuning
 
@@ -72,14 +112,26 @@ All knobs live in `EngineConfig` (`engine.py`). The sensitive ones:
 | `yolo_conf` | 0.15 | Raise if random objects get tracked; lower if the ball vanishes near the rim. |
 | `coast_frames` | 6 | How long to predict through occlusion. Coasted points never count toward a make. |
 | `shot_cooldown_seconds` | 2.0 | Raise if rebounds double-trigger. |
+| `device` | auto | `cuda`, `mps` or `cpu`. Auto-detected; `CLIPCOURT_DEVICE` overrides it for a whole process. |
+| `batch_frames` | auto | Frames per inference call — 8 on a GPU, 1 on CPU. Lower it if a GPU runs out of memory on 4K footage. |
+| `vertical_reframe` | False | Also cut a 9:16 copy of every clip, cropped around the ball. |
 
 ## Deploying
 
-The engine is fully headless (no GUI, no `input()`, no display probing). For production: put uvicorn behind nginx with a matching `client_max_body_size`, swap the in-memory job registry for Redis/DB if you need multi-process workers, and add periodic cleanup of `data/videos/`.
+The engine is fully headless (no GUI, no `input()`, no display probing). Job
+and video state is kept in memory *and* mirrored to JSON sidecars under
+`data/videos/`, which is enough to survive a restart but still assumes a
+single process — for multi-process workers, move the registry to Redis or a
+database. Otherwise: put uvicorn behind nginx with a matching
+`client_max_body_size`, and add periodic cleanup of `data/videos/`.
+
+`data/` is gitignored, as are the model weights — don't commit footage.
 
 ## Roadmap
 
-- [ ] Batch queue UI (process a whole season of games)
-- [ ] Auto-suggest the rim box (rim detector model) with manual confirm
-- [ ] Vertical/social reframe export
+- [x] Batch queue UI (process a whole season of games)
+- [x] Auto-suggest the rim box with manual confirm
+- [x] Vertical/social reframe export
 - [x] Per-session shot chart from event coordinates
+- [ ] Multi-process job registry (Redis/DB) for horizontal scaling
+- [ ] Auto-suggest a rim box per *camera angle* rather than per video
