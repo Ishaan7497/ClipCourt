@@ -3,5 +3,25 @@ __pycache__/
 *.pyo
 .env
 .DS_Store
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Model weights — downloaded on first run (~22 MB each)
 *.pt
+
+# Uploaded footage, cut clips, roster/coaching sidecars
+data/
+
+# Source footage in any location
 *.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+
+# Local scratch
+/Screenshot*.png
