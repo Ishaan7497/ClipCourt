@@ -1,5 +1,5 @@
 """
-HoopClip export — CSV and PDF coaching reports.
+ClipCourt export — CSV and PDF coaching reports.
 
 Pure functions over already-assembled job/roster dicts (no disk I/O, no
 FastAPI coupling). Keeps server.py free of report-layout code and keeps
@@ -163,7 +163,7 @@ def build_pdf(job_snapshot: dict, players_by_id: dict,
     ])
 
     story = [
-        Paragraph(f"HoopClip Report — {video_display_name}", styles["Title"]),
+        Paragraph(f"ClipCourt Report — {video_display_name}", styles["Title"]),
         Paragraph(
             f"{len(events)} shot{'s' if len(events) != 1 else ''} — "
             f"{made} made, {len(events) - made} missed. "
@@ -200,7 +200,7 @@ def build_pdf(job_snapshot: dict, players_by_id: dict,
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=LETTER,
-                            title="HoopClip coaching report")
+                            title="ClipCourt coaching report")
     doc.build(story)
     buf.seek(0)
     return buf.read()

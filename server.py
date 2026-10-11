@@ -1,5 +1,5 @@
 """
-HoopClip server — upload footage, mark the rim in the browser, get clips.
+ClipCourt server — upload footage, mark the rim in the browser, get clips.
 
 Run:  uvicorn server:app --reload
 Then open http://127.0.0.1:8000
@@ -45,7 +45,7 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
-app = FastAPI(title="HoopClip")
+app = FastAPI(title="ClipCourt")
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,9 @@ PLAYER_PALETTE = ["#f2c14e", "#8ecbff", "#e9701e", "#c9a0ff",
                   "#6fd6c4", "#f28db2", "#efeae0", "#a0b8ff"]
 
 
+TERMINAL_STATES = ("done", "error", "cancelled")
+
+
 @dataclass
 class Job:
     id: str
@@ -76,6 +79,7 @@ class Job:
     clips: list = field(default_factory=list)
     error: str | None = None
     hoop_box: tuple | None = None   # (x, y, w, h) in source pixels
+    device: str | None = None       # which compute device ran the analysis
     cancel_flag: threading.Event = field(default_factory=threading.Event)
     created_at: float = field(default_factory=time.time)
 
@@ -90,7 +94,158 @@ class Job:
             "events": list(self.events),
             "clips": list(self.clips),
             "error": self.error,
+            "device": self.device,
+            "created_at": self.created_at,
         }
+
+    def persisted(self) -> dict:
+        return {**self.snapshot(), "hoop_box": list(self.hoop_box)
+                if self.hoop_box else None}
+
+
+# ---------------------------------------------------------------------------
+# Disk persistence
+#
+# The registries above are the live working set; these sidecar files are the
+# durable copy. Without them a restart orphaned every past job: the clips were
+# still on disk but GET /api/jobs/{id} 404'd, so the results page was gone for
+# good. Format mirrors the existing roster.json / coaching.json convention —
+# plain JSON next to the footage it describes, no database to run.
+# ---------------------------------------------------------------------------
+
+def _atomic_write_json(path: str, data: dict):
+    """Write via temp + rename so a crash mid-write can't leave a half file
+    that breaks the next startup scan."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _video_meta_path(vdir: str) -> str:
+    return os.path.join(vdir, "video.json")
+
+
+def _job_meta_path(vdir: str, job_id: str) -> str:
+    return os.path.join(vdir, "jobs", f"{job_id}.json")
+
+
+def _persist_video(record: dict):
+    public = {k: v for k, v in record.items() if k not in ("path", "dir")}
+    public["source_name"] = os.path.basename(record["path"])
+    _atomic_write_json(_video_meta_path(record["dir"]), public)
+
+
+def _persist_job(job: Job, video: dict):
+    _atomic_write_json(_job_meta_path(video["dir"], job.id), job.persisted())
+
+
+def _adopt_legacy_dir(video_id: str, vdir: str) -> bool:
+    """Write sidecars for an upload processed before persistence existed.
+
+    Those directories hold the footage and the cut clips but no metadata, so
+    without this they would stay unreachable forever. Returns False if the
+    directory isn't a usable upload after all.
+    """
+    sources = [n for n in sorted(os.listdir(vdir))
+               if os.path.splitext(n)[1].lower() in ALLOWED_EXTENSIONS
+               and n.startswith("source")]
+    if not sources:
+        return False
+    source = os.path.join(vdir, sources[0])
+    try:
+        meta = engine.probe_video(source)
+    except ValueError:
+        return False
+    _persist_video({
+        "id": video_id, "path": source, "dir": vdir,
+        "display_name": sources[0], "size_bytes": os.path.getsize(source),
+        "uploaded_at": os.path.getmtime(source), **meta,
+    })
+
+    clips_root = os.path.join(vdir, "clips")
+    for job_id in sorted(os.listdir(clips_root) if os.path.isdir(clips_root) else []):
+        manifest = os.path.join(clips_root, job_id, "clips.json")
+        if not os.path.isfile(manifest):
+            continue
+        try:
+            with open(manifest) as f:
+                clips = json.load(f)
+            coaching_path = os.path.join(clips_root, job_id, "coaching.json")
+            box = None
+            if os.path.isfile(coaching_path):
+                with open(coaching_path) as f:
+                    hb = json.load(f).get("hoop_box")
+                box = [hb["x"], hb["y"], hb["w"], hb["h"]] if hb else None
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        events = {e["frame"]: e for c in clips for e in c.get("events", [])}
+        _atomic_write_json(_job_meta_path(vdir, job_id), {
+            "id": job_id, "video_id": video_id, "mode": "all", "status": "done",
+            "progress": 1.0,
+            "message": f"Done — {len(clips)} clip{'s' if len(clips) != 1 else ''} cut",
+            "events": [events[k] for k in sorted(events)], "clips": clips,
+            "error": None, "device": None, "hoop_box": box,
+            "created_at": os.path.getmtime(manifest),
+        })
+    return True
+
+
+def _restore_from_disk():
+    """Rebuild the video and job registries from the sidecar files on boot."""
+    if not os.path.isdir(VIDEO_DIR):
+        return
+    for video_id in sorted(os.listdir(VIDEO_DIR)):
+        vdir = os.path.join(VIDEO_DIR, video_id)
+        if not os.path.isdir(vdir):
+            continue
+        meta_path = _video_meta_path(vdir)
+        if not os.path.isfile(meta_path) and not _adopt_legacy_dir(video_id, vdir):
+            continue
+        if not os.path.isfile(meta_path):
+            continue  # adoption didn't produce metadata — skip it
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            source = os.path.join(vdir, meta.pop("source_name", ""))
+            if not os.path.isfile(source):
+                continue
+            _videos[video_id] = {**meta, "id": video_id,
+                                 "path": source, "dir": vdir}
+        except (OSError, ValueError):
+            continue  # unreadable sidecar: skip this video, don't crash boot
+
+        jobs_dir = os.path.join(vdir, "jobs")
+        if not os.path.isdir(jobs_dir):
+            continue
+        for name in sorted(os.listdir(jobs_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(jobs_dir, name)) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            box = data.get("hoop_box")
+            job = Job(
+                id=data["id"], video_id=video_id, mode=data.get("mode", "all"),
+                status=data.get("status", "error"),
+                progress=data.get("progress", 0.0),
+                message=data.get("message", ""),
+                events=data.get("events") or [],
+                clips=data.get("clips") or [],
+                error=data.get("error"),
+                hoop_box=tuple(box) if box else None,
+                device=data.get("device"),
+                created_at=data.get("created_at", 0.0),
+            )
+            if job.status not in TERMINAL_STATES:
+                # Its worker thread died with the old process.
+                job.status = "error"
+                job.error = "Interrupted by a server restart. Run it again."
+                job.message = "Interrupted"
+            _jobs[job.id] = job
 
 
 def _video_or_404(video_id: str) -> dict:
@@ -150,13 +305,36 @@ async def upload_video(file: UploadFile = File(...)):
         "dir": vdir,
         "display_name": os.path.basename(file.filename or "video"),
         "size_bytes": size,
+        "uploaded_at": time.time(),
         **meta,
     }
     with _lock:
         _videos[video_id] = record
+    _persist_video(record)
 
     public = {k: v for k, v in record.items() if k not in ("path", "dir")}
     return JSONResponse(public)
+
+
+@app.get("/api/videos")
+def list_videos():
+    """Uploads still on disk, newest first, each with its finished jobs — this
+    is what lets the browser rebuild the queue after a reload or a restart."""
+    with _lock:
+        videos = list(_videos.values())
+        jobs = list(_jobs.values())
+    by_video: dict[str, list] = {}
+    for j in sorted(jobs, key=lambda j: j.created_at):
+        by_video.setdefault(j.video_id, []).append(
+            {"id": j.id, "status": j.status, "mode": j.mode,
+             "shots": len(j.events), "clips": len(j.clips)})
+    out = []
+    for v in videos:
+        public = {k: val for k, val in v.items() if k not in ("path", "dir")}
+        public["jobs"] = by_video.get(v["id"], [])
+        out.append(public)
+    out.sort(key=lambda v: v.get("uploaded_at") or 0, reverse=True)
+    return {"videos": out}
 
 
 @app.get("/api/videos/{video_id}/frame")
@@ -170,11 +348,27 @@ def get_frame(video_id: str, t: float = 0.0):
                     headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/videos/{video_id}/suggest-rim")
+def suggest_rim(video_id: str):
+    """Best-effort rim box for the browser to pre-fill. Always confirmed by
+    the user, so `box: null` ("couldn't find it") is a fine answer."""
+    v = _video_or_404(video_id)
+    try:
+        box = engine.suggest_hoop_box(v["path"])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {"box": box}
+
+
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str):
     v = _video_or_404(video_id)
     with _lock:
         _videos.pop(video_id, None)
+        # Drop this video's jobs too, otherwise they linger in the registry
+        # pointing at footage and clips that no longer exist.
+        for jid in [j.id for j in _jobs.values() if j.video_id == video_id]:
+            _jobs.pop(jid, None)
     shutil.rmtree(v["dir"], ignore_errors=True)
     return {"deleted": video_id}
 
@@ -268,6 +462,7 @@ class JobRequest(BaseModel):
     mode: str = Field(default="all", pattern="^(made|miss|all)$")
     clip_before_seconds: float = Field(default=3.0, ge=0, le=30)
     clip_after_seconds: float = Field(default=1.0, ge=0, le=30)
+    vertical_reframe: bool = False
 
 
 @app.post("/api/jobs")
@@ -283,10 +478,12 @@ def create_job(req: JobRequest):
               hoop_box=(b.x, b.y, b.w, b.h))
     with _lock:
         _jobs[job.id] = job
+    _persist_job(job, v)
 
     cfg = engine.EngineConfig(
         clip_before_seconds=req.clip_before_seconds,
         clip_after_seconds=req.clip_after_seconds,
+        vertical_reframe=req.vertical_reframe,
     )
     hoop = (b.x, b.y, b.w, b.h)
     _executor.submit(_run_job, job, v, hoop, cfg)
@@ -311,6 +508,7 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
             on_progress=progress, on_event=on_event,
             should_cancel=job.cancel_flag.is_set,
         )
+        job.device = analysis.device
         if job.cancel_flag.is_set():
             job.status = "cancelled"
             job.message = "Cancelled"
@@ -320,7 +518,7 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
         clip_dir = os.path.join(video["dir"], "clips", job.id)
         job.clips = engine.cut_clips(
             video["path"], analysis, job.mode, clip_dir, cfg,
-            on_progress=progress,
+            on_progress=progress, hoop_box=hoop_box,
         )
         _write_coaching_meta(video, job.id, hoop_box)
         job.progress = 1.0
@@ -332,6 +530,10 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
         job.status = "error"
         job.error = str(exc)
         job.message = "Processing failed"
+    finally:
+        # Durable either way: a finished job survives a restart, and a failed
+        # one keeps its error message instead of vanishing.
+        _persist_job(job, video)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -434,7 +636,9 @@ def _clip_path(job: Job, filename: str) -> str:
     v = _video_or_404(job.video_id)
     clip_dir = os.path.join(v["dir"], "clips", job.id)
     path = os.path.normpath(os.path.join(clip_dir, filename))
-    if not path.startswith(clip_dir) or not os.path.isfile(path):
+    # Compare against clip_dir + separator: a bare startswith would also
+    # accept a sibling directory that merely begins with this job's id.
+    if not path.startswith(clip_dir + os.sep) or not os.path.isfile(path):
         raise HTTPException(404, "Clip not found.")
     return path
 
@@ -455,10 +659,13 @@ def get_clips_zip(job_id: str):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
         for c in job.clips:
             z.write(_clip_path(job, c["file"]), arcname=c["file"])
+            if c.get("vertical_file"):
+                z.write(_clip_path(job, c["vertical_file"]),
+                        arcname=c["vertical_file"])
     buf.seek(0)
     return StreamingResponse(
         buf, media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="hoopclip_clips.zip"'},
+        headers={"Content-Disposition": 'attachment; filename="clipcourt_clips.zip"'},
     )
 
 
@@ -485,7 +692,7 @@ def export_csv(job_id: str):
     # utf-8-sig BOM so the file opens cleanly in Excel.
     return Response(
         content=csv_text.encode("utf-8-sig"), media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="hoopclip_stats.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="clipcourt_stats.csv"'},
     )
 
 
@@ -499,9 +706,12 @@ def export_pdf(job_id: str):
         raise HTTPException(501, str(exc))
     return Response(
         content=pdf_bytes, media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="hoopclip_report.pdf"'},
+        headers={"Content-Disposition": 'attachment; filename="clipcourt_report.pdf"'},
     )
 
+
+# Pick up everything processed before this process started.
+_restore_from_disk()
 
 # Static frontend (mounted last so /api keeps priority).
 app.mount("/", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True),
