@@ -1,20 +1,45 @@
-/* HoopClip frontend — vanilla JS, no build step.
+/* ClipCourt frontend — vanilla JS, no build step.
    Flow: upload -> mark rim -> run job (polled) -> results. */
 
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 
+/* The queue is the source of truth for "which videos are we working on".
+   state.video / state.box / state.job are views onto the SELECTED item, kept
+   in sync by selectVideo() so the rim canvas and results only ever describe
+   one video at a time. Rim boxes are stored per item in SOURCE pixels, since
+   each video can have its own preview scale. */
 const state = {
-  video: null,        // metadata from POST /api/videos
+  queue: [],          // [{ videoId, video, box (source px|null), job }]
+  selected: null,     // videoId
+  video: null,        // metadata for the selected video
   frameImg: null,     // Image() of the current preview frame
   frameScale: 1,      // source px per preview px
   box: null,          // {x,y,w,h} in PREVIEW pixel space
-  job: null,
+  job: null,          // job snapshot shown in the results step
   pollTimer: null,
   roster: [],         // players from GET /api/videos/{id}/roster
   drillFilter: "all",
 };
+
+const ACTIVE_STATES = ["queued", "analyzing", "clipping"];
+
+function queueItem(videoId) {
+  return state.queue.find((q) => q.videoId === videoId) || null;
+}
+
+function selectedItem() {
+  return queueItem(state.selected);
+}
+
+/* Copy the canvas box back onto the selected queue item — but only once its
+   frame has actually loaded, or an early switch would erase a stored box
+   (sourceBox() is null until there's a frame to measure against). */
+function stashCurrentBox() {
+  const item = selectedItem();
+  if (item && state.frameImg) item.box = sourceBox();
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -29,10 +54,10 @@ function fmtBytes(n) {
   return Math.round(n / 1e3) + " KB";
 }
 
-function setStepEnabled(id, enabled) {
+function setStepEnabled(id, enabled, scroll = true) {
   const el = $(id);
   el.setAttribute("aria-disabled", String(!enabled));
-  if (enabled) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (enabled && scroll) el.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function apiError(res) {
@@ -62,51 +87,205 @@ const fileInput = $("fileInput");
   })
 );
 dropzone.addEventListener("drop", (e) => {
-  const file = e.dataTransfer.files && e.dataTransfer.files[0];
-  if (file) uploadFile(file);
+  if (e.dataTransfer.files && e.dataTransfer.files.length) {
+    uploadFiles([...e.dataTransfer.files]);
+  }
 });
 fileInput.addEventListener("change", () => {
-  if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+  if (fileInput.files.length) uploadFiles([...fileInput.files]);
 });
 
-function uploadFile(file) {
+/* Uploads run one at a time on purpose: several 2 GB files in parallel just
+   fight each other for bandwidth and make every progress bar misleading. */
+async function uploadFiles(files) {
   $("uploadError").textContent = "";
-  $("fileMeta").textContent = "";
-  $("uploadTrack").hidden = false;
-  $("uploadStatus").textContent = `Uploading ${file.name}…`;
-
-  const form = new FormData();
-  form.append("file", file);
-
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/videos");
-  xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) {
-      $("uploadFill").style.width = (e.loaded / e.total) * 100 + "%";
+  for (let i = 0; i < files.length; i += 1) {
+    const label = files.length > 1 ? ` (${i + 1} of ${files.length})` : "";
+    try {
+      const data = await uploadOne(files[i], label);
+      addToQueue(data);
+      // Select the first upload of a batch so step 2 is immediately usable.
+      if (i === 0 || !state.selected) await selectVideo(data.id);
+    } catch (err) {
+      $("uploadError").textContent =
+        `${files[i].name}: ${err.message}` +
+        (files.length > 1 ? " — continuing with the rest." : "");
     }
-  };
-  xhr.onerror = () => {
-    $("uploadError").textContent = "Upload failed — check that the server is running, then try again.";
-    $("uploadStatus").textContent = "";
-  };
-  xhr.onload = () => {
-    $("uploadTrack").hidden = true;
-    $("uploadFill").style.width = "0%";
-    let data;
-    try { data = JSON.parse(xhr.responseText); } catch { data = {}; }
-    if (xhr.status >= 400) {
-      $("uploadError").textContent = data.detail || "Upload failed.";
-      $("uploadStatus").textContent = "";
-      return;
+  }
+  $("uploadStatus").textContent = "";
+  $("uploadTrack").hidden = true;
+  $("uploadFill").style.width = "0%";
+  renderQueue();
+}
+
+function uploadOne(file, label) {
+  return new Promise((resolve, reject) => {
+    $("uploadTrack").hidden = false;
+    $("uploadStatus").textContent = `Uploading ${file.name}${label}…`;
+    const form = new FormData();
+    form.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/videos");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        $("uploadFill").style.width = (e.loaded / e.total) * 100 + "%";
+      }
+    };
+    xhr.onerror = () =>
+      reject(new Error("upload failed — check that the server is still running"));
+    xhr.onload = () => {
+      let data;
+      try { data = JSON.parse(xhr.responseText); } catch { data = {}; }
+      if (xhr.status >= 400) reject(new Error(data.detail || "upload failed"));
+      else resolve(data);
+    };
+    xhr.send(form);
+  });
+}
+
+function addToQueue(video) {
+  if (queueItem(video.id)) return;
+  state.queue.push({ videoId: video.id, video, box: null, job: null });
+}
+
+/* ------------------------------------------------------------------ queue */
+
+function jobBadge(job) {
+  if (!job) return { cls: "pending", text: "Not run yet" };
+  if (job.status === "done") {
+    const shots = job.events ? job.events.length : job.shots || 0;
+    return { cls: "done", text: `${shots} shot${shots === 1 ? "" : "s"}` };
+  }
+  if (job.status === "error") return { cls: "error", text: "Failed" };
+  if (job.status === "cancelled") return { cls: "pending", text: "Cancelled" };
+  return { cls: "running", text: `${Math.round((job.progress || 0) * 100)}%` };
+}
+
+function renderQueue() {
+  const list = $("queueList");
+  list.innerHTML = "";
+  if (!state.queue.length) {
+    const li = document.createElement("li");
+    li.className = "queue-empty";
+    li.textContent = "Nothing queued yet — choose one or more videos above.";
+    list.appendChild(li);
+    $("runAllBtn").hidden = true;
+    return;
+  }
+
+  state.queue.forEach((item) => {
+    const li = document.createElement("li");
+    li.className = "queue-item" + (item.videoId === state.selected ? " selected" : "");
+
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "queue-pick";
+    pick.setAttribute("aria-pressed", String(item.videoId === state.selected));
+
+    const name = document.createElement("span");
+    name.className = "queue-name";
+    name.textContent = item.video.display_name;
+
+    const meta = document.createElement("span");
+    meta.className = "queue-meta";
+    meta.textContent =
+      `${item.video.width}×${item.video.height} · ${fmtTime(item.video.duration_s || 0)}` +
+      (item.box ? " · rim marked" : " · rim not marked");
+
+    const badge = jobBadge(item.job);
+    const status = document.createElement("span");
+    status.className = `queue-badge ${badge.cls}`;
+    status.textContent = badge.text;
+
+    pick.append(name, meta, status);
+    pick.addEventListener("click", () => selectVideo(item.videoId));
+
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "queue-remove";
+    rm.textContent = "✕";
+    rm.setAttribute("aria-label",
+      `Delete ${item.video.display_name} and any clips cut from it`);
+    rm.addEventListener("click", () => removeFromQueue(item));
+
+    li.append(pick, rm);
+    list.appendChild(li);
+  });
+
+  const runnable = state.queue.filter(
+    (q) => q.box && !(q.job && ACTIVE_STATES.includes(q.job.status)));
+  $("runAllBtn").hidden = state.queue.length < 2 || !runnable.length;
+  $("runAllBtn").textContent = `Run every marked video (${runnable.length})`;
+}
+
+async function removeFromQueue(item) {
+  // This deletes the uploaded footage and its clips from the server, so it
+  // needs to be a deliberate act rather than a stray click on a small ✕.
+  const confirmed = window.confirm(
+    `Delete "${item.video.display_name}" and any clips cut from it?\n\n` +
+    "This removes the uploaded footage from the server and can't be undone.");
+  if (!confirmed) return;
+  if (item.job && ACTIVE_STATES.includes(item.job.status)) {
+    await fetch(`/api/jobs/${item.job.id}/cancel`, { method: "POST" });
+  }
+  await fetch(`/api/videos/${item.videoId}`, { method: "DELETE" });
+  state.queue = state.queue.filter((q) => q.videoId !== item.videoId);
+  $("queueStatus").textContent = `${item.video.display_name} removed.`;
+  if (state.selected === item.videoId) {
+    state.selected = null;
+    state.video = null;
+    state.job = null;
+    state.box = null;
+    if (state.queue.length) await selectVideo(state.queue[0].videoId);
+    else {
+      setStepEnabled("step-rim", false);
+      setStepEnabled("step-run", false);
+      setStepEnabled("step-results", false);
     }
-    state.video = data;
-    $("uploadStatus").textContent = "";
-    $("fileMeta").innerHTML =
-      `<strong>${data.display_name}</strong> · ${data.width}×${data.height} · ` +
-      `${data.fps.toFixed(1)} fps · ${fmtTime(data.duration_s || 0)} · ${fmtBytes(data.size_bytes)}`;
-    initRimStep();
-  };
-  xhr.send(form);
+  }
+  renderQueue();
+}
+
+async function selectVideo(videoId) {
+  const item = queueItem(videoId);
+  if (!item) return;
+
+  // Stash the in-progress box of the video we're leaving, in source pixels.
+  if (state.selected !== videoId) stashCurrentBox();
+
+  state.selected = videoId;
+  state.video = item.video;
+  state.job = null;
+  state.frameImg = null;
+  state.box = null;
+  $("jobError").textContent = "";
+  $("eventFeed").innerHTML = "";
+  $("fileMeta").innerHTML =
+    `<strong>${esc(item.video.display_name)}</strong> · ${item.video.width}×${item.video.height} · ` +
+    `${(item.video.fps || 0).toFixed(1)} fps · ${fmtTime(item.video.duration_s || 0)} · ` +
+    fmtBytes(item.video.size_bytes || 0);
+
+  initRimStep(item);
+  renderQueue();
+
+  setStepEnabled("step-results", false);
+  if (!item.job) return;
+
+  // The queue may only hold a summary (id + status) for jobs restored from an
+  // earlier session, so fetch the full snapshot before rendering anything
+  // that expects events, progress and clips.
+  const res = await fetch(`/api/jobs/${item.job.id}`);
+  if (!res.ok) return;
+  const job = await res.json();
+  item.job = job;
+  state.job = job;
+  renderJob(job);
+  if (job.status === "done") await showResults(job, { scroll: false });
+  else if (job.status === "error") {
+    $("jobError").textContent = job.error || "Processing failed.";
+  }
+  resetRunControls();
+  renderQueue();
 }
 
 /* ------------------------------------------------------------- rim canvas */
@@ -114,14 +293,16 @@ function uploadFile(file) {
 const canvas = $("rimCanvas");
 const ctx = canvas.getContext("2d");
 
-function initRimStep() {
+function initRimStep(item) {
   const scrub = $("frameScrub");
   scrub.max = Math.max(0, (state.video.duration_s || 1) - 0.2).toFixed(1);
   scrub.value = 0;
+  $("scrubTime").textContent = "0:00";
   state.box = null;
-  loadFrame(0);
-  setStepEnabled("step-rim", true);
-  setStepEnabled("step-run", true);
+  // Restore this video's own rim box once the frame (and its scale) is loaded.
+  loadFrame(0, item && item.box ? item.box : null);
+  setStepEnabled("step-rim", true, false);
+  setStepEnabled("step-run", true, false);
 }
 
 let frameDebounce = null;
@@ -132,14 +313,22 @@ $("frameScrub").addEventListener("input", (e) => {
   frameDebounce = setTimeout(() => loadFrame(t), 180);
 });
 
-function loadFrame(t) {
+function loadFrame(t, restoreSourceBox = null) {
   const img = new Image();
+  // Which video this frame belongs to: switching queue items mid-load must
+  // not drop the old video's frame onto the newly selected one.
+  const forVideo = state.selected;
   img.onload = () => {
+    if (state.selected !== forVideo) return;
     state.frameImg = img;
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
     state.frameScale = state.video.width / img.naturalWidth;
+    if (restoreSourceBox) {
+      setSourceBox(restoreSourceBox, { announce: false });
+    }
     draw();
+    announceBox();
   };
   img.onerror = () => {
     $("rimStatus").textContent = "Couldn't load that frame — try a different position.";
@@ -168,21 +357,32 @@ function draw() {
   }
 }
 
-function announceBox() {
+function announceBox(message) {
   if (!state.box) {
     $("rimStatus").textContent = "No rim box yet — drag on the frame to draw one.";
   } else {
     const b = sourceBox();
-    $("rimStatus").textContent =
+    $("rimStatus").textContent = (message ? message + " " : "") +
       `Rim box set: ${Math.round(b.w)}×${Math.round(b.h)} px at (${Math.round(b.x)}, ${Math.round(b.y)}).`;
   }
+  // The queue item owns the box; state.box is just the canvas-space view.
+  stashCurrentBox();
   syncFields();
+  renderQueue();
 }
 
 function sourceBox() {
   const s = state.frameScale;
   const b = state.box;
   return b ? { x: b.x * s, y: b.y * s, w: b.w * s, h: b.h * s } : null;
+}
+
+function setSourceBox(b, { announce = true, message } = {}) {
+  const s = state.frameScale || 1;
+  state.box = { x: b.x / s, y: b.y / s, w: b.w / s, h: b.h / s };
+  clampBox();
+  draw();
+  if (announce) announceBox(message);
 }
 
 function syncFields() {
@@ -206,6 +406,52 @@ function syncFields() {
     }
   })
 );
+
+/* ----- rim tools: auto-suggest, copy to other videos ----- */
+
+$("suggestRimBtn").addEventListener("click", async () => {
+  if (!state.video) return;
+  const btn = $("suggestRimBtn");
+  btn.disabled = true;
+  $("rimStatus").textContent = "Looking for the rim…";
+  try {
+    const res = await fetch(`/api/videos/${state.video.id}/suggest-rim`);
+    if (!res.ok) throw new Error(await apiError(res));
+    const { box } = await res.json();
+    if (!box) {
+      $("rimStatus").textContent =
+        "Couldn't find the rim automatically — draw the box by hand instead.";
+      return;
+    }
+    setSourceBox(box, {
+      message: `Suggested from ${box.frames_agreeing} of ${box.frames_sampled} sampled frames — check it and adjust.`,
+    });
+  } catch (err) {
+    $("rimStatus").textContent = `Rim suggestion failed — ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("applyRimAllBtn").addEventListener("click", () => {
+  const b = sourceBox();
+  if (!b) {
+    $("rimStatus").textContent = "Mark a rim box first, then copy it to the others.";
+    return;
+  }
+  // Only same-size footage: a box in pixel coordinates means nothing against
+  // a different frame size, and a wrong rim box silently ruins detection.
+  const targets = state.queue.filter(
+    (q) => q.videoId !== state.selected &&
+      q.video.width === state.video.width && q.video.height === state.video.height);
+  targets.forEach((q) => { q.box = { ...b }; });
+  const skipped = state.queue.length - 1 - targets.length;
+  $("rimStatus").textContent = targets.length
+    ? `Rim box copied to ${targets.length} video${targets.length === 1 ? "" : "s"}` +
+      (skipped ? `; ${skipped} skipped for a different frame size.` : ".")
+    : "No other videos share this frame size, so the box wasn't copied.";
+  renderQueue();
+});
 
 function clampBox() {
   const b = state.box;
@@ -300,100 +546,162 @@ canvas.addEventListener("keydown", (e) => {
 
 /* -------------------------------------------------------------------- job */
 
-$("startBtn").addEventListener("click", startJob);
-$("cancelBtn").addEventListener("click", async () => {
-  if (state.job) await fetch(`/api/jobs/${state.job.id}/cancel`, { method: "POST" });
-});
-$("restartBtn").addEventListener("click", () => location.reload());
-
-async function startJob() {
+$("startBtn").addEventListener("click", async () => {
   $("jobError").textContent = "";
-  const b = sourceBox();
-  if (!b) {
-    $("jobError").textContent = "Mark the rim first (step 2) — detection needs to know where the hoop is.";
+  const item = selectedItem();
+  if (!item) {
+    $("jobError").textContent = "Upload a video first.";
+    return;
+  }
+  if (!sourceBox()) {
+    $("jobError").textContent =
+      "Mark the rim first (step 2) — detection needs to know where the hoop is.";
     $("step-rim").scrollIntoView({ behavior: "smooth" });
     return;
   }
-  const mode = document.querySelector('input[name="mode"]:checked').value;
+  item.box = sourceBox();
+  const started = await startJobFor(item);
+  if (started) {
+    $("eventFeed").innerHTML = "";
+    $("jobTrack").hidden = false;
+  }
+});
 
+$("runAllBtn").addEventListener("click", async () => {
+  $("jobError").textContent = "";
+  stashCurrentBox();
+  const runnable = state.queue.filter(
+    (q) => q.box && !(q.job && ACTIVE_STATES.includes(q.job.status)));
+  if (!runnable.length) {
+    $("jobError").textContent =
+      "No queued video has a rim box yet. Mark one, then copy it to the others.";
+    return;
+  }
+  $("jobTrack").hidden = false;
+  for (const item of runnable) await startJobFor(item);
+  $("queueStatus").textContent =
+    `Started ${runnable.length} job${runnable.length === 1 ? "" : "s"}. ` +
+    "They run a couple at a time; the queue shows each one's progress.";
+});
+
+$("cancelBtn").addEventListener("click", async () => {
+  const item = selectedItem();
+  if (item && item.job) {
+    await fetch(`/api/jobs/${item.job.id}/cancel`, { method: "POST" });
+  }
+});
+
+$("restartBtn").addEventListener("click", () => location.reload());
+
+async function startJobFor(item) {
+  const mode = document.querySelector('input[name="mode"]:checked').value;
   const res = await fetch("/api/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      video_id: state.video.id,
-      hoop_box: b,
+      video_id: item.videoId,
+      hoop_box: item.box,
       mode,
       clip_before_seconds: +$("beforeS").value || 3,
       clip_after_seconds: +$("afterS").value || 1,
+      vertical_reframe: $("verticalChk").checked,
     }),
   });
   if (!res.ok) {
-    $("jobError").textContent = await apiError(res);
-    return;
+    $("jobError").textContent =
+      `${item.video.display_name}: ${await apiError(res)}`;
+    return false;
   }
-  state.job = await res.json();
-  $("startBtn").disabled = true;
-  $("cancelBtn").hidden = false;
-  $("jobTrack").hidden = false;
-  $("eventFeed").innerHTML = "";
+  item.job = await res.json();
+  if (item.videoId === state.selected) {
+    state.job = item.job;
+    $("startBtn").disabled = true;
+    $("cancelBtn").hidden = false;
+  }
+  renderQueue();
   poll();
+  return true;
 }
 
+/* One ticker polls every in-flight job: a batch of ten videos shouldn't mean
+   ten independent timers drifting against each other. */
 function poll() {
   clearTimeout(state.pollTimer);
   state.pollTimer = setTimeout(async () => {
-    const res = await fetch(`/api/jobs/${state.job.id}`);
-    if (!res.ok) {
-      $("jobError").textContent = await apiError(res);
+    const active = state.queue.filter(
+      (q) => q.job && ACTIVE_STATES.includes(q.job.status));
+    if (!active.length) {
       resetRunControls();
       return;
     }
-    const job = await res.json();
-    renderJob(job);
-    if (["done", "error", "cancelled"].includes(job.status)) {
-      resetRunControls();
-      if (job.status === "done") showResults(job);
-      if (job.status === "error") $("jobError").textContent = job.error || "Processing failed.";
-    } else {
-      poll();
-    }
+    await Promise.all(active.map(async (item) => {
+      const res = await fetch(`/api/jobs/${item.job.id}`);
+      if (!res.ok) {
+        item.job = { ...item.job, status: "error", error: await apiError(res) };
+        return;
+      }
+      const job = await res.json();
+      const wasActive = ACTIVE_STATES.includes(item.job.status);
+      item.job = job;
+      if (item.videoId === state.selected) {
+        state.job = job;
+        renderJob(job);
+        if (job.status === "done") await showResults(job);
+        if (job.status === "error") {
+          $("jobError").textContent = job.error || "Processing failed.";
+        }
+      } else if (wasActive && job.status === "done") {
+        $("queueStatus").textContent =
+          `${item.video.display_name} finished — ${job.events.length} ` +
+          `shot${job.events.length === 1 ? "" : "s"}. Select it to see the clips.`;
+      }
+    }));
+    renderQueue();
+    poll();
   }, 1000);
 }
 
 function resetRunControls() {
-  $("startBtn").disabled = false;
-  $("cancelBtn").hidden = true;
+  const item = selectedItem();
+  const busy = item && item.job && ACTIVE_STATES.includes(item.job.status);
+  $("startBtn").disabled = Boolean(busy);
+  $("cancelBtn").hidden = !busy;
 }
 
 function renderJob(job) {
-  const pct = Math.round(job.progress * 100);
+  const events = job.events || [];
+  const pct = Math.round((job.progress || 0) * 100);
   $("jobFill").style.width = pct + "%";
   $("jobFill").setAttribute("aria-valuenow", String(pct));
-  $("jobStatus").textContent = `${pct}% — ${job.message}`;
+  $("jobStatus").textContent = `${pct}% — ${job.message || job.status}`;
 
   const feed = $("eventFeed");
-  while (feed.children.length < job.events.length) {
-    const ev = job.events[feed.children.length];
+  // Switching videos means the feed belongs to a different job: rebuild it
+  // rather than appending this job's shots onto the previous one's.
+  if (feed.children.length > events.length) feed.innerHTML = "";
+  while (feed.children.length < events.length) {
+    const ev = events[feed.children.length];
     const li = document.createElement("li");
     li.innerHTML =
       `<span>${fmtTime(ev.time_s)}</span>` +
       `<span class="badge ${ev.result}">${ev.result}</span>` +
-      `<span class="badge confidence">${ev.confidence} confidence</span>`;
+      `<span class="badge confidence">${esc(ev.confidence)} confidence</span>`;
     feed.appendChild(li);
   }
 }
 
 /* ---------------------------------------------------------------- results */
 
-async function showResults(job) {
+async function showResults(job, { scroll = true } = {}) {
   state.job = job;
-  setStepEnabled("step-results", true);
+  setStepEnabled("step-results", true, scroll);
   const dur = state.video.duration_s || 1;
   const made = job.events.filter((e) => e.result === "made").length;
   const miss = job.events.length - made;
+  const on = job.device ? ` Analyzed on ${DEVICE_LABELS[job.device] || job.device}.` : "";
   $("resultsSummary").textContent =
     `${job.events.length} shot${job.events.length === 1 ? "" : "s"} detected ` +
-    `(${made} made, ${miss} missed) — ${job.clips.length} clip${job.clips.length === 1 ? "" : "s"} cut.`;
+    `(${made} made, ${miss} missed) — ${job.clips.length} clip${job.clips.length === 1 ? "" : "s"} cut.` + on;
 
   await loadRoster();
 
@@ -422,6 +730,10 @@ async function showResults(job) {
     const badges = clip.events
       .map((e) => `<span class="badge ${e.result}">${e.result}</span>`)
       .join("");
+    const vertical = clip.vertical_file
+      ? `<a class="download" href="/api/jobs/${job.id}/clips/${encodeURIComponent(clip.vertical_file)}"
+            download>Download 9:16 version</a>`
+      : "";
     card.innerHTML =
       `<video controls preload="metadata" src="${url}"
               aria-label="Clip from ${fmtTime(clip.start_s)} to ${fmtTime(clip.end_s)}"></video>
@@ -429,6 +741,7 @@ async function showResults(job) {
          <span class="clip-title">${fmtTime(clip.start_s)} – ${fmtTime(clip.end_s)}</span>
          <div class="badges">${badges}</div>
          <a class="download" href="${url}" download>Download clip</a>
+         ${vertical}
        </div>`;
 
     const body = card.querySelector(".clip-body");
@@ -468,6 +781,7 @@ const DRILL_LABELS = {
   three_pointers: "3-Pointers",
   midrange: "Mid-range",
 };
+const DEVICE_LABELS = { cuda: "an NVIDIA GPU", mps: "the Apple GPU", cpu: "the CPU" };
 const COURT_HOOP_Y = 5.25; // hoop center, feet from the baseline (matches the SVG)
 
 function esc(s) {
@@ -872,3 +1186,35 @@ function applyDrillFilter() {
     ? `${DRILL_LABELS[tag]}: ${att} shot${att === 1 ? "" : "s"}, ${made} made (${pct}%).`
     : `${DRILL_LABELS[tag]}: no shots tagged yet.`;
 }
+
+/* -------------------------------------------------------- session restore */
+
+/* Footage and finished jobs outlive the page (and the server process), so the
+   queue is rebuilt from the API instead of starting empty on every reload. */
+async function restoreSession() {
+  try {
+    const res = await fetch("/api/videos");
+    if (!res.ok) throw new Error(await apiError(res));
+    const { videos } = await res.json();
+    videos.forEach((v) => {
+      const jobs = v.jobs || [];
+      const done = [...jobs].reverse().find((j) => j.status === "done");
+      state.queue.push({
+        videoId: v.id,
+        video: v,
+        box: null,
+        job: done || jobs[jobs.length - 1] || null,
+      });
+    });
+    if (videos.length) {
+      $("queueStatus").textContent =
+        `${videos.length} video${videos.length === 1 ? "" : "s"} from earlier — ` +
+        "select one to re-open its highlights, or upload more.";
+    }
+  } catch (err) {
+    $("queueStatus").textContent = `Couldn't list earlier videos — ${err.message}`;
+  }
+  renderQueue();
+}
+
+restoreSession();

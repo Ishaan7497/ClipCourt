@@ -1,4 +1,4 @@
-/* HoopClip — film-room design system
+/* ClipCourt — film-room design system
    Palette: chalkboard slate, chalk white, basketball leather, telestrator tape.
    Type: Anton (display) / Barlow (body) / IBM Plex Mono (timecodes). */
 
@@ -262,6 +262,106 @@ input[type="radio"] { width: 1.1rem; height: 1.1rem; accent-color: var(--leather
   color: var(--chalk-dim);
 }
 .file-meta strong { color: var(--chalk); font-weight: 600; }
+
+/* ---------- Batch queue ---------- */
+
+.queue-head {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  letter-spacing: 0.02em;
+  margin: 1.75rem 0 0.35rem;
+}
+
+.queue-list { list-style: none; margin: 0.75rem 0 0; padding: 0; display: grid; gap: 0.5rem; }
+
+.queue-empty {
+  color: var(--chalk-dim);
+  font-size: 0.95rem;
+  padding: 0.75rem 0;
+}
+
+.queue-item {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  background: var(--court-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.queue-item.selected { border-color: var(--tape); }
+
+.queue-pick {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "name badge" "meta badge";
+  gap: 0.15rem 0.75rem;
+  align-items: center;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0.7rem 0.9rem;
+  cursor: pointer;
+}
+.queue-pick:hover { background: rgba(242, 193, 78, 0.07); }
+
+.queue-name {
+  grid-area: name;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.queue-meta {
+  grid-area: meta;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--chalk-dim);
+}
+
+.queue-badge {
+  grid-area: badge;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.queue-badge.pending { color: var(--chalk-dim); }
+.queue-badge.running { color: var(--tape); }
+.queue-badge.done { color: var(--make); }
+.queue-badge.error { color: var(--miss); }
+
+.queue-remove {
+  background: none;
+  border: 0;
+  border-left: 1px solid var(--line);
+  color: var(--chalk-dim);
+  font-size: 1rem;
+  padding: 0 0.85rem;
+  cursor: pointer;
+}
+.queue-remove:hover { color: var(--miss); background: rgba(226, 96, 77, 0.1); }
+
+.rim-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.15rem 0.5rem;
+  align-items: center;
+  font-weight: 500;
+}
+.check-row .hint { grid-column: 2; }
 
 /* ---------- Rim canvas (the telestrator) ---------- */
 
