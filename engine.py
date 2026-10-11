@@ -1,5 +1,5 @@
 """
-HoopClip engine — web-native basketball shot detection and clipping.
+ClipCourt engine — web-native basketball shot detection and clipping.
 
 This is the headless core behind the web app. It is a refactor of the CLI
 ball-tracking script into an importable, callback-driven module:
@@ -20,7 +20,7 @@ Detection carries over every fix from the reviewed CLI version:
     front-of-rim brick that reappears below the rim does not count.
   * Shot cooldown suppresses rebound double-triggers.
 
-New noise-reduction work in this version:
+Noise reduction:
   * Detection picking scores confidence against jump distance instead of
     taking the nearest box blindly, so a second ball / round object on the
     sideline doesn't steal the track.
@@ -29,6 +29,17 @@ New noise-reduction work in this version:
   * Ball centers are EMA-smoothed to remove per-frame YOLO jitter before the
     shot detector sees them (raw positions are kept for the jump check so
     smoothing can't mask a real teleport).
+
+Throughput and output options:
+  * Inference runs on CUDA or Apple MPS when either is available (CPU
+    otherwise), and frames are submitted in batches so the GPU isn't idling
+    between single-frame round trips. Frames still reach the tracker in
+    order, so batching can never change a made/miss call.
+  * suggest_hoop_box() proposes a rim box from the rim's colour, shape and
+    stillness across sampled frames — a starting point for the user to
+    confirm, never an automatic decision.
+  * Clips can additionally be cut as a 9:16 vertical reframe centred on the
+    ball, for phone and social output.
 """
 
 from __future__ import annotations
@@ -47,6 +58,7 @@ import numpy as np
 # Lazy YOLO import: the server should start (and report a clear error) even if
 # ultralytics isn't installed yet.
 _YOLO = None
+_DEVICE: Optional[str] = None
 
 
 def _load_yolo(model_name: str):
@@ -62,6 +74,38 @@ def _load_yolo(model_name: str):
     return _YOLO
 
 
+def resolve_device() -> str:
+    """Pick the fastest available torch device: CUDA, then Apple MPS, then CPU.
+
+    Cached — probing MPS costs a few milliseconds and the answer can't change
+    while the process lives. CLIPCOURT_DEVICE overrides (e.g. "cpu" to rule
+    the GPU out when debugging a suspected backend bug).
+    """
+    global _DEVICE
+    if _DEVICE is not None:
+        return _DEVICE
+    override = os.environ.get("CLIPCOURT_DEVICE", "").strip()
+    if override:
+        _DEVICE = override
+        return _DEVICE
+    try:
+        import torch
+        if torch.cuda.is_available():
+            _DEVICE = "cuda"
+        elif torch.backends.mps.is_available():
+            _DEVICE = "mps"
+        else:
+            _DEVICE = "cpu"
+    except Exception:
+        # No torch, or a backend probe that raised: CPU is always safe.
+        _DEVICE = "cpu"
+    return _DEVICE
+
+
+def device_label(device: str) -> str:
+    return {"cuda": "NVIDIA GPU", "mps": "Apple GPU", "cpu": "CPU"}.get(device, device)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -72,6 +116,8 @@ class EngineConfig:
     yolo_model: str = "yolov8s.pt"
     yolo_conf: float = 0.15          # low: catches the faint/blurry ball at the rim
     sports_ball_class: int = 32
+    device: Optional[str] = None     # None = auto (CUDA > Apple MPS > CPU)
+    batch_frames: int = 0            # 0 = auto: >1 on a GPU, 1 on CPU
 
     # Tracking
     max_jump_ratio: float = 0.18     # fraction of frame WIDTH the ball may move/frame
@@ -90,6 +136,8 @@ class EngineConfig:
     # Clipping
     clip_before_seconds: float = 3.0
     clip_after_seconds: float = 1.0
+    vertical_reframe: bool = False   # also crop a 9:16 cut for social/phone
+    vertical_height: int = 1920
 
 
 @dataclass
@@ -132,6 +180,7 @@ class AnalysisResult:
     width: int
     height: int
     duration_s: float
+    device: str = "cpu"
     events: list = field(default_factory=list)   # list[ShotEvent]
 
 
@@ -195,6 +244,112 @@ def extract_frame_jpeg(path: str, time_s: float, max_width: int = 1280) -> bytes
     if not ok:
         raise ValueError("Could not encode the preview frame.")
     return buf.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Rim suggestion
+# ---------------------------------------------------------------------------
+#
+# A rim and a basketball are the same color, so color alone can't separate
+# them. Two things can:
+#   * Shape — a rim's bounding box is WIDE (seen at an angle) and mostly
+#     HOLLOW (it's a ring: contour area is a small share of its box), while a
+#     ball is square-ish and solid.
+#   * Time — the rim is in the same place in every frame; the ball is not.
+# The suggestion is always confirmed by the user, so a near miss is cheap.
+
+RIM_HSV_LOW = (3, 90, 60)      # orange-red, reasonably saturated and lit
+RIM_HSV_HIGH = (23, 255, 255)
+
+
+def _rim_candidates(frame) -> list:
+    """Rim-ish boxes in one frame: [(score, x, y, w, h), ...], best first."""
+    h_img, w_img = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(RIM_HSV_LOW, np.uint8),
+                       np.array(RIM_HSV_HIGH, np.uint8))
+    # Close small gaps in the ring so the whole rim is one contour.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    out = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if h < 3 or w < 8:
+            continue
+        if w < 0.02 * w_img or w > 0.25 * w_img:
+            continue          # too small to mark, or too big to be a rim
+        if y > 0.72 * h_img:
+            continue          # rims live in the upper part of the frame
+        aspect = w / h
+        if aspect < 1.2 or aspect > 7.0:
+            continue          # a ball is ~1.0; a rim is flat and wide
+        fill = cv2.contourArea(c) / float(w * h)
+        score = (min(aspect, 4.0) / 4.0) * 0.5      # flatter is better
+        score += (1.0 - min(fill, 1.0)) * 0.3       # hollower is better
+        score += (1.0 - y / (0.72 * h_img)) * 0.2   # higher is better
+        out.append((round(score, 4), x, y, w, h))
+    out.sort(reverse=True)
+    return out
+
+
+def suggest_hoop_box(path: str, samples: int = 6) -> Optional[dict]:
+    """Scan a handful of frames and propose a rim box, or None if unsure.
+
+    Candidates that recur in the same spot across frames are boosted: that
+    temporal agreement is what separates the (static) rim from the (moving)
+    ball when both are orange.
+    """
+    meta = probe_video(path)
+    duration = meta["duration_s"] or 0.0
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError("Could not open the video.")
+
+    # Spread samples across the middle of the video — the opening seconds are
+    # often a tip-off huddle or a title card with no rim in shot.
+    picks = []
+    for i in range(max(1, samples)):
+        frac = 0.15 + (0.7 * i / max(1, samples - 1)) if samples > 1 else 0.5
+        picks.append(frac * duration if duration else 0.0)
+
+    per_frame = []
+    for t in picks:
+        if duration:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            per_frame.append(_rim_candidates(frame)[:5])
+    cap.release()
+
+    flat = [c for frame_cands in per_frame for c in frame_cands]
+    if not flat:
+        return None
+
+    best = None
+    for score, x, y, w, h in flat:
+        cx, cy = x + w / 2, y + h / 2
+        agree = 0
+        for other in per_frame:
+            if any(abs((ox + ow / 2) - cx) < max(w, 12) and
+                   abs((oy + oh / 2) - cy) < max(h, 12)
+                   for _s, ox, oy, ow, oh in other):
+                agree += 1
+        total = score * (1.0 + 0.45 * (agree - 1))
+        if best is None or total > best[0]:
+            best = (total, agree, x, y, w, h)
+
+    total, agree, x, y, w, h = best
+    if agree < 2 or total < 0.45:
+        # Seen in only one frame, or weak shape evidence: don't guess.
+        return None
+    return {
+        "x": float(x), "y": float(y), "w": float(w), "h": float(h),
+        "frames_agreeing": agree,
+        "frames_sampled": len(per_frame),
+        "score": round(float(total), 3),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -411,55 +566,69 @@ def analyze_video(
     on_event: Optional[EventCB] = None,
     should_cancel: Optional[CancelCheck] = None,
 ) -> AnalysisResult:
-    """Single decode pass: YOLO -> tracker -> shot detector -> events."""
+    """Single decode pass: YOLO -> tracker -> shot detector -> events.
+
+    Frames are inferred in batches on a GPU (one host->device round trip for
+    several frames instead of one per frame) but still fed to the tracker and
+    detector strictly in order, so batching cannot change classification.
+    """
     meta = probe_video(path)
     fps, total = meta["fps"], meta["frame_count"]
     model = _load_yolo(cfg.yolo_model)
+    device = cfg.device or resolve_device()
+    batch = cfg.batch_frames or (8 if device != "cpu" else 1)
 
     cap = cv2.VideoCapture(path)
     tracker = BallTracker(meta["width"], cfg)
     detector = HoopShotDetector(hoop_box, fps, cfg)
     result = AnalysisResult(
         fps=fps, frame_count=total, width=meta["width"], height=meta["height"],
-        duration_s=meta["duration_s"] or 0.0,
+        duration_s=meta["duration_s"] or 0.0, device=device,
     )
 
     max_ball_px = cfg.max_ball_frac * meta["width"]
     frame_idx = -1
     report_every = max(1, int(fps))  # ~once a second of video
+    on_device = device_label(device)
 
     while True:
         if should_cancel and should_cancel():
             break
-        ok, frame = cap.read()
-        if not ok:
+        frames = []
+        while len(frames) < batch:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+        if not frames:
             break
-        frame_idx += 1
 
-        yolo_out = model.predict(frame, conf=cfg.yolo_conf, verbose=False,
-                                 classes=[cfg.sports_ball_class])
-        detections = []
+        yolo_out = model.predict(frames, conf=cfg.yolo_conf, verbose=False,
+                                 classes=[cfg.sports_ball_class], device=device)
+
         for r in yolo_out:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                w, h = x2 - x1, y2 - y1
-                if w > max_ball_px or h > max_ball_px:
-                    continue  # implausibly large "ball" — reject the noise
-                detections.append(((x1 + x2) / 2, (y1 + y2) / 2, w, h,
-                                   float(box.conf[0])))
+            frame_idx += 1
+            detections = []
+            if r.boxes is not None:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    w, h = x2 - x1, y2 - y1
+                    if w > max_ball_px or h > max_ball_px:
+                        continue  # implausibly large "ball" — reject the noise
+                    detections.append(((x1 + x2) / 2, (y1 + y2) / 2, w, h,
+                                       float(box.conf[0])))
 
-        point, kind = tracker.update(detections, frame_idx)
-        event = detector.update(point, kind, frame_idx)
-        if event:
-            result.events.append(event)
-            if on_event:
-                on_event(event)
+            point, kind = tracker.update(detections, frame_idx)
+            event = detector.update(point, kind, frame_idx)
+            if event:
+                result.events.append(event)
+                if on_event:
+                    on_event(event)
 
-        if on_progress and frame_idx % report_every == 0:
-            frac = (frame_idx / total) if total else 0.0
-            on_progress(min(frac, 0.999), f"Analyzing frame {frame_idx:,}")
+            if on_progress and frame_idx % report_every == 0:
+                frac = (frame_idx / total) if total else 0.0
+                on_progress(min(frac, 0.999),
+                            f"Analyzing frame {frame_idx:,} on {on_device}")
 
     cap.release()
     if not total:
@@ -490,6 +659,42 @@ def _merge_windows(windows: list) -> list:
     return [tuple(m) for m in merged]
 
 
+def _even(n: int) -> int:
+    """libx264 with yuv420p needs even pixel dimensions."""
+    return int(n) - (int(n) % 2)
+
+
+def vertical_crop_window(width: int, height: int, center_x: Optional[float],
+                         center_y: Optional[float] = None) -> tuple:
+    """A 9:16 crop window (w, h, x, y) centered on the action, clamped inside
+    the frame. Landscape sources keep full height; already-tall sources keep
+    full width instead of being cropped to nothing."""
+    target = 9 / 16
+    if width / height > target:
+        cw, ch = _even(round(height * target)), _even(height)
+    else:
+        cw, ch = _even(width), _even(round(width / target))
+    cw, ch = max(2, min(cw, _even(width))), max(2, min(ch, _even(height)))
+    cx = (width / 2) if center_x is None else center_x
+    cy = (height / 2) if center_y is None else center_y
+    x = int(min(max(0, cx - cw / 2), width - cw))
+    y = int(min(max(0, cy - ch / 2), height - ch))
+    return cw, ch, x, y
+
+
+def _window_center(events: list, hoop_box: Optional[tuple]) -> tuple:
+    """Horizontal/vertical focus for a reframe: the mean ball position across
+    the window's shots, falling back to the rim box, then the frame center."""
+    xs = [e.ball_x for e in events if e.ball_x is not None]
+    ys = [e.ball_y for e in events if e.ball_y is not None]
+    if xs:
+        return sum(xs) / len(xs), (sum(ys) / len(ys) if ys else None)
+    if hoop_box:
+        x, y, w, h = hoop_box
+        return x + w / 2, y + h / 2
+    return None, None
+
+
 def cut_clips(
     video_path: str,
     analysis: AnalysisResult,
@@ -497,6 +702,7 @@ def cut_clips(
     out_dir: str,
     cfg: EngineConfig,
     on_progress: Optional[ProgressCB] = None,
+    hoop_box: Optional[tuple] = None,
 ) -> list:
     """Cut one clip per (merged) shot window. Returns clip metadata dicts."""
     os.makedirs(out_dir, exist_ok=True)
@@ -512,6 +718,8 @@ def cut_clips(
 
     clips = []
     have_ffmpeg = shutil.which("ffmpeg") is not None
+    steps = len(windows) * (2 if cfg.vertical_reframe else 1)
+    done = 0
 
     for i, (start, end, events) in enumerate(windows, 1):
         label = "-".join(sorted({e.result for e in events}))
@@ -522,15 +730,36 @@ def cut_clips(
             _cut_ffmpeg(video_path, start, end, out_path)
         else:
             _cut_opencv(video_path, start, end, out_path, analysis)
+        done += 1
+        if on_progress:
+            on_progress(done / steps, f"Cut clip {i} of {len(windows)}")
 
-        clips.append({
+        clip = {
             "file": name,
             "start_s": round(start, 2),
             "end_s": round(end, 2),
             "events": [e.to_dict() for e in events],
-        })
-        if on_progress:
-            on_progress(i / len(windows), f"Cut clip {i} of {len(windows)}")
+        }
+
+        if cfg.vertical_reframe:
+            cx, cy = _window_center(events, hoop_box)
+            crop = vertical_crop_window(analysis.width, analysis.height, cx, cy)
+            vname = f"clip_{i:02d}_{label}_{_ts(start)}_vertical.mp4"
+            vpath = os.path.join(out_dir, vname)
+            out_h = _even(cfg.vertical_height)
+            out_w = _even(round(out_h * 9 / 16))
+            if have_ffmpeg:
+                _cut_ffmpeg(video_path, start, end, vpath,
+                            crop=crop, scale=(out_w, out_h))
+            else:
+                _cut_opencv(video_path, start, end, vpath, analysis,
+                            crop=crop, scale=(out_w, out_h))
+            clip["vertical_file"] = vname
+            done += 1
+            if on_progress:
+                on_progress(done / steps, f"Reframed clip {i} of {len(windows)}")
+
+        clips.append(clip)
 
     with open(os.path.join(out_dir, "clips.json"), "w") as f:
         json.dump(clips, f, indent=2)
@@ -542,13 +771,24 @@ def _ts(seconds: float) -> str:
     return f"{m:02d}m{s:02d}s"
 
 
-def _cut_ffmpeg(src: str, start: float, end: float, out_path: str):
+def _cut_ffmpeg(src: str, start: float, end: float, out_path: str,
+                crop: Optional[tuple] = None, scale: Optional[tuple] = None):
     """Frame-accurate cut with audio preserved. Re-encodes video so the clip
     starts exactly where the play does — stream-copy would snap to the
     previous keyframe and reintroduce the old drift bug."""
+    filters = []
+    if crop:
+        cw, ch, cx, cy = crop
+        filters.append(f"crop={cw}:{ch}:{cx}:{cy}")
+    if scale:
+        filters.append(f"scale={scale[0]}:{scale[1]}")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", src,
+    ]
+    if filters:
+        cmd += ["-vf", ",".join(filters)]
+    cmd += [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
         out_path,
@@ -559,14 +799,20 @@ def _cut_ffmpeg(src: str, start: float, end: float, out_path: str):
 
 
 def _cut_opencv(src: str, start: float, end: float, out_path: str,
-                analysis: AnalysisResult):
+                analysis: AnalysisResult, crop: Optional[tuple] = None,
+                scale: Optional[tuple] = None):
     """Fallback: single sequential decode pass (no cap.set() keyframe drift).
     No audio — OpenCV can't mux it and ffmpeg isn't available here."""
     cap = cv2.VideoCapture(src)
     fps = analysis.fps
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps,
-                             (analysis.width, analysis.height))
+    if scale:
+        size = tuple(scale)
+    elif crop:
+        size = (crop[0], crop[1])
+    else:
+        size = (analysis.width, analysis.height)
+    writer = cv2.VideoWriter(out_path, fourcc, fps, size)
     start_f, end_f = int(start * fps), int(end * fps)
     idx = -1
     while True:
@@ -578,6 +824,11 @@ def _cut_opencv(src: str, start: float, end: float, out_path: str,
             continue
         if idx > end_f:
             break
+        if crop:
+            cw, ch, cx, cy = crop
+            frame = frame[cy:cy + ch, cx:cx + cw]
+        if scale and (frame.shape[1], frame.shape[0]) != tuple(scale):
+            frame = cv2.resize(frame, scale, interpolation=cv2.INTER_AREA)
         writer.write(frame)
     writer.release()
     cap.release()
