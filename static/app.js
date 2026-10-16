@@ -93,6 +93,9 @@ dropzone.addEventListener("drop", (e) => {
 });
 fileInput.addEventListener("change", () => {
   if (fileInput.files.length) uploadFiles([...fileInput.files]);
+  // Reset so choosing the same file again (e.g. after deleting it) still
+  // fires "change".
+  fileInput.value = "";
 });
 
 /* Uploads run one at a time on purpose: several 2 GB files in parallel just
@@ -238,6 +241,7 @@ async function removeFromQueue(item) {
     state.box = null;
     if (state.queue.length) await selectVideo(state.queue[0].videoId);
     else {
+      $("fileMeta").innerHTML = "";   // still described the deleted video
       setStepEnabled("step-rim", false);
       setStepEnabled("step-run", false);
       setStepEnabled("step-results", false);
@@ -266,9 +270,13 @@ async function selectVideo(videoId) {
     fmtBytes(item.video.size_bytes || 0);
 
   initRimStep(item);
-  renderQueue();
-
   setStepEnabled("step-results", false);
+  // The progress line describes the selected video's job, not the last one.
+  $("jobTrack").hidden = true;
+  $("jobFill").style.width = "0%";
+  $("jobStatus").textContent = "";
+  resetRunControls();
+  renderQueue();
   if (!item.job) return;
 
   // The queue may only hold a summary (id + status) for jobs restored from an
@@ -278,7 +286,10 @@ async function selectVideo(videoId) {
   if (!res.ok) return;
   const job = await res.json();
   item.job = job;
+  // Another video may have been selected while this was loading.
+  if (state.selected !== videoId) return;
   state.job = job;
+  $("jobTrack").hidden = false;
   renderJob(job);
   if (job.status === "done") await showResults(job, { scroll: false });
   else if (job.status === "error") {
@@ -286,6 +297,7 @@ async function selectVideo(videoId) {
   }
   resetRunControls();
   renderQueue();
+  if (ACTIVE_STATES.includes(job.status)) poll();
 }
 
 /* ------------------------------------------------------------- rim canvas */
@@ -299,8 +311,10 @@ function initRimStep(item) {
   scrub.value = 0;
   $("scrubTime").textContent = "0:00";
   state.box = null;
+  // A scrub on the previous video must not load a frame into this one.
+  clearTimeout(frameDebounce);
   // Restore this video's own rim box once the frame (and its scale) is loaded.
-  loadFrame(0, item && item.box ? item.box : null);
+  loadFrame(0, true);
   setStepEnabled("step-rim", true, false);
   setStepEnabled("step-run", true, false);
 }
@@ -313,7 +327,7 @@ $("frameScrub").addEventListener("input", (e) => {
   frameDebounce = setTimeout(() => loadFrame(t), 180);
 });
 
-function loadFrame(t, restoreSourceBox = null) {
+function loadFrame(t, restoreBox = false) {
   const img = new Image();
   // Which video this frame belongs to: switching queue items mid-load must
   // not drop the old video's frame onto the newly selected one.
@@ -324,8 +338,11 @@ function loadFrame(t, restoreSourceBox = null) {
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
     state.frameScale = state.video.width / img.naturalWidth;
-    if (restoreSourceBox) {
-      setSourceBox(restoreSourceBox, { announce: false });
+    // Read the item's box now rather than when the load started, so a box
+    // set while the frame was loading (e.g. a rim suggestion) isn't lost.
+    const item = selectedItem();
+    if (restoreBox && item && item.box) {
+      setSourceBox(item.box, { announce: false });
     }
     draw();
     announceBox();
@@ -410,17 +427,34 @@ function syncFields() {
 /* ----- rim tools: auto-suggest, copy to other videos ----- */
 
 $("suggestRimBtn").addEventListener("click", async () => {
-  if (!state.video) return;
+  // The scan takes a while; remember which video it is for.
+  const item = selectedItem();
+  if (!item) return;
   const btn = $("suggestRimBtn");
   btn.disabled = true;
   $("rimStatus").textContent = "Looking for the rim…";
   try {
-    const res = await fetch(`/api/videos/${state.video.id}/suggest-rim`);
+    const res = await fetch(`/api/videos/${item.videoId}/suggest-rim`);
     if (!res.ok) throw new Error(await apiError(res));
     const { box } = await res.json();
+    const stillShown = state.selected === item.videoId;
     if (!box) {
-      $("rimStatus").textContent =
-        "Couldn't find the rim automatically — draw the box by hand instead.";
+      if (stillShown) {
+        $("rimStatus").textContent =
+          "Couldn't find the rim automatically — draw the box by hand instead.";
+      }
+      return;
+    }
+    if (!stillShown || !state.frameImg) {
+      // The user moved on, or this video's frame hasn't loaded yet: keep the
+      // box on the video it was found in (loadFrame picks it up from there),
+      // instead of drawing it onto whatever is on the canvas now.
+      item.box = { x: box.x, y: box.y, w: box.w, h: box.h };
+      if (!stillShown) {
+        $("queueStatus").textContent =
+          `Rim suggested for ${item.video.display_name} — select it to check the box.`;
+      }
+      renderQueue();
       return;
     }
     setSourceBox(box, {
@@ -561,10 +595,7 @@ $("startBtn").addEventListener("click", async () => {
   }
   item.box = sourceBox();
   const started = await startJobFor(item);
-  if (started) {
-    $("eventFeed").innerHTML = "";
-    $("jobTrack").hidden = false;
-  }
+  if (started) $("eventFeed").innerHTML = "";
 });
 
 $("runAllBtn").addEventListener("click", async () => {
@@ -577,7 +608,6 @@ $("runAllBtn").addEventListener("click", async () => {
       "No queued video has a rim box yet. Mark one, then copy it to the others.";
     return;
   }
-  $("jobTrack").hidden = false;
   for (const item of runnable) await startJobFor(item);
   $("queueStatus").textContent =
     `Started ${runnable.length} job${runnable.length === 1 ? "" : "s"}. ` +
@@ -593,6 +623,13 @@ $("cancelBtn").addEventListener("click", async () => {
 
 $("restartBtn").addEventListener("click", () => location.reload());
 
+/* 0 is a real answer ("start the clip at the shot"), so only fall back to the
+   default when the field is empty or not a number. */
+function secondsField(id, fallback) {
+  const v = parseFloat($(id).value);
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
 async function startJobFor(item) {
   const mode = document.querySelector('input[name="mode"]:checked').value;
   const res = await fetch("/api/jobs", {
@@ -602,8 +639,8 @@ async function startJobFor(item) {
       video_id: item.videoId,
       hoop_box: item.box,
       mode,
-      clip_before_seconds: +$("beforeS").value || 3,
-      clip_after_seconds: +$("afterS").value || 1,
+      clip_before_seconds: secondsField("beforeS", 3),
+      clip_after_seconds: secondsField("afterS", 1),
       vertical_reframe: $("verticalChk").checked,
     }),
   });
@@ -614,6 +651,7 @@ async function startJobFor(item) {
   }
   item.job = await res.json();
   if (item.videoId === state.selected) {
+    $("jobTrack").hidden = false;
     state.job = item.job;
     $("startBtn").disabled = true;
     $("cancelBtn").hidden = false;
@@ -634,31 +672,39 @@ function poll() {
       resetRunControls();
       return;
     }
-    await Promise.all(active.map(async (item) => {
-      const res = await fetch(`/api/jobs/${item.job.id}`);
-      if (!res.ok) {
-        item.job = { ...item.job, status: "error", error: await apiError(res) };
-        return;
-      }
-      const job = await res.json();
-      const wasActive = ACTIVE_STATES.includes(item.job.status);
-      item.job = job;
-      if (item.videoId === state.selected) {
-        state.job = job;
-        renderJob(job);
-        if (job.status === "done") await showResults(job);
-        if (job.status === "error") {
-          $("jobError").textContent = job.error || "Processing failed.";
-        }
-      } else if (wasActive && job.status === "done") {
-        $("queueStatus").textContent =
-          `${item.video.display_name} finished — ${job.events.length} ` +
-          `shot${job.events.length === 1 ? "" : "s"}. Select it to see the clips.`;
-      }
-    }));
+    await Promise.all(active.map((item) => refreshJob(item).catch(() => {
+      // Server briefly unreachable (e.g. restarting): keep the job as it was
+      // and try again next tick, rather than letting one rejected fetch stop
+      // the ticker for every job.
+    })));
     renderQueue();
+    // The selected video's job may have finished while others still run.
+    resetRunControls();
     poll();
   }, 1000);
+}
+
+async function refreshJob(item) {
+  const res = await fetch(`/api/jobs/${item.job.id}`);
+  if (!res.ok) {
+    item.job = { ...item.job, status: "error", error: await apiError(res) };
+    return;
+  }
+  const job = await res.json();
+  const wasActive = ACTIVE_STATES.includes(item.job.status);
+  item.job = job;
+  if (item.videoId === state.selected) {
+    state.job = job;
+    renderJob(job);
+    if (job.status === "done") await showResults(job);
+    if (job.status === "error") {
+      $("jobError").textContent = job.error || "Processing failed.";
+    }
+  } else if (wasActive && job.status === "done") {
+    $("queueStatus").textContent =
+      `${item.video.display_name} finished — ${job.events.length} ` +
+      `shot${job.events.length === 1 ? "" : "s"}. Select it to see the clips.`;
+  }
 }
 
 function resetRunControls() {
@@ -693,17 +739,20 @@ function renderJob(job) {
 /* ---------------------------------------------------------------- results */
 
 async function showResults(job, { scroll = true } = {}) {
+  const forVideo = state.selected;
   state.job = job;
-  setStepEnabled("step-results", true, scroll);
   const dur = state.video.duration_s || 1;
+  await loadRoster();
+  // Switching videos while the roster loaded: this job is no longer on screen.
+  if (state.selected !== forVideo) return;
+
+  setStepEnabled("step-results", true, scroll);
   const made = job.events.filter((e) => e.result === "made").length;
   const miss = job.events.length - made;
   const on = job.device ? ` Analyzed on ${DEVICE_LABELS[job.device] || job.device}.` : "";
   $("resultsSummary").textContent =
     `${job.events.length} shot${job.events.length === 1 ? "" : "s"} detected ` +
     `(${made} made, ${miss} missed) — ${job.clips.length} clip${job.clips.length === 1 ? "" : "s"} cut.` + on;
-
-  await loadRoster();
 
   // Timeline strip
   const tl = $("timeline");
@@ -1197,13 +1246,16 @@ async function restoreSession() {
     if (!res.ok) throw new Error(await apiError(res));
     const { videos } = await res.json();
     videos.forEach((v) => {
-      const jobs = v.jobs || [];
-      const done = [...jobs].reverse().find((j) => j.status === "done");
+      const jobs = [...(v.jobs || [])].reverse();   // newest first
+      // A job still running (page reloaded mid-run) beats an older finished
+      // one, or it would be hidden and never polled.
+      const active = jobs.find((j) => ACTIVE_STATES.includes(j.status));
+      const done = jobs.find((j) => j.status === "done");
       state.queue.push({
         videoId: v.id,
         video: v,
         box: null,
-        job: done || jobs[jobs.length - 1] || null,
+        job: active || done || jobs[0] || null,
       });
     });
     if (videos.length) {
@@ -1215,6 +1267,7 @@ async function restoreSession() {
     $("queueStatus").textContent = `Couldn't list earlier videos — ${err.message}`;
   }
   renderQueue();
+  poll();   // picks up any job still running; a no-op tick otherwise
 }
 
 restoreSession();
