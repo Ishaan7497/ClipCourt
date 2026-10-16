@@ -188,6 +188,68 @@ def test_unreadable_sidecar_does_not_break_startup():
     teardown()
 
 
+def test_malformed_job_sidecar_does_not_break_startup():
+    setup()
+    video = make_video()
+    server._persist_job(done_job(video), video)
+    jobs_dir = os.path.join(video["dir"], "jobs")
+    # Valid JSON, wrong shape: no id, and a top-level list.
+    with open(os.path.join(jobs_dir, "noid.json"), "w") as f:
+        json.dump({"status": "done"}, f)
+    with open(os.path.join(jobs_dir, "list.json"), "w") as f:
+        json.dump([1, 2, 3], f)
+    server._videos.clear()
+    server._jobs.clear()
+    server._restore_from_disk()   # must not raise
+    assert "vid1" in server._videos
+    assert list(server._jobs) == ["job1"], list(server._jobs)
+    teardown()
+
+
+def test_deleting_a_video_cancels_its_job_and_stays_deleted():
+    setup()
+    video = make_video()
+    job = server.Job(id="running", video_id="vid1", mode="all",
+                     status="analyzing")
+    server._jobs[job.id] = job
+    server.delete_video("vid1")
+    assert job.cancel_flag.is_set(), "a running job should be cancelled"
+    assert not os.path.exists(video["dir"])
+
+    # The worker finishing afterwards must not recreate the folder.
+    real_analyze = engine.analyze_video
+    engine.analyze_video = lambda *a, **k: engine.AnalysisResult(
+        fps=30.0, frame_count=0, width=320, height=240, duration_s=0.0)
+    try:
+        server._run_job(job, video, (1, 1, 10, 4), engine.EngineConfig())
+    finally:
+        engine.analyze_video = real_analyze
+    assert job.status == "cancelled", job.status
+    assert not os.path.exists(video["dir"]), "deleted video's folder came back"
+    teardown()
+
+
+def test_cancel_during_clipping_is_not_reported_as_done():
+    setup()
+    video = make_video()
+    job = server.Job(id="j", video_id="vid1", mode="all")
+    server._jobs[job.id] = job
+    real_analyze, real_cut = engine.analyze_video, engine.cut_clips
+    engine.analyze_video = lambda *a, **k: engine.AnalysisResult(
+        fps=30.0, frame_count=45, width=320, height=240, duration_s=1.5)
+
+    def cut_then_cancelled(*a, **k):
+        job.cancel_flag.set()     # user hits Cancel while clips are cutting
+        return []
+    engine.cut_clips = cut_then_cancelled
+    try:
+        server._run_job(job, video, (1, 1, 10, 4), engine.EngineConfig())
+    finally:
+        engine.analyze_video, engine.cut_clips = real_analyze, real_cut
+    assert job.status == "cancelled", job.status
+    teardown()
+
+
 # -------------------------------------------------------------------- roster
 
 def test_roster_add_list_remove():
@@ -269,6 +331,28 @@ def test_snapshot_without_a_hoop_box_has_no_coordinates():
     job.hoop_box = None          # e.g. a job adopted from a legacy directory
     for event in server.job_status("job1")["events"]:
         assert event["court_x_ft"] is None and event["court_dist_ft"] is None
+    teardown()
+
+
+def test_status_polls_do_not_mutate_the_jobs_own_events():
+    setup()
+    video = make_video()
+    job = done_job(video)
+    before = [dict(e) for e in job.events]
+    server.job_status("job1")
+    server.job_status("job1")
+    assert job.events == before, job.events[0].keys()
+    teardown()
+
+
+def test_jobs_need_a_nonzero_clip_length():
+    setup()
+    make_video()
+    req = server.JobRequest(video_id="vid1",
+                            hoop_box=server.HoopBox(x=10, y=10, w=40, h=12),
+                            clip_before_seconds=0, clip_after_seconds=0)
+    raises_http(422, server.create_job, req)
+    assert not server._jobs, "no job should have been created"
     teardown()
 
 

@@ -91,6 +91,16 @@ def test_pdf_is_a_pdf():
     assert len(pdf) > 5000, f"suspiciously small PDF: {len(pdf)} bytes"
 
 
+def test_pdf_title_survives_markup_in_the_video_name():
+    """reportlab parses Paragraph text as markup; a filename is not markup."""
+    try:
+        pdf = export.build_pdf({"events": events()}, PLAYERS, "<b>final & <br>.mp4")
+    except RuntimeError as exc:
+        print(f"SKIP  test_pdf_title_survives_markup_in_the_video_name: {exc}")
+        return
+    assert pdf.startswith(b"%PDF-")
+
+
 def test_pdf_with_no_located_shots_still_renders():
     """Every shot missing coordinates must not break the court chart."""
     evs = [{"frame": 1, "time_s": 1.0, "result": "miss", "confidence": "medium",

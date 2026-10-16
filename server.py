@@ -91,7 +91,9 @@ class Job:
             "status": self.status,
             "progress": round(self.progress, 4),
             "message": self.message,
-            "events": list(self.events),
+            # Copy each event: callers enrich the snapshot's events in place,
+            # which must not leak into (or race with) the job's own records.
+            "events": [dict(e) for e in self.events],
             "clips": list(self.clips),
             "error": self.error,
             "device": self.device,
@@ -178,9 +180,9 @@ def _adopt_legacy_dir(video_id: str, vdir: str) -> bool:
                 with open(coaching_path) as f:
                     hb = json.load(f).get("hoop_box")
                 box = [hb["x"], hb["y"], hb["w"], hb["h"]] if hb else None
-        except (OSError, ValueError, KeyError, TypeError):
+            events = {e["frame"]: e for c in clips for e in c.get("events", [])}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
-        events = {e["frame"]: e for c in clips for e in c.get("events", [])}
         _atomic_write_json(_job_meta_path(vdir, job_id), {
             "id": job_id, "video_id": video_id, "mode": "all", "status": "done",
             "progress": 1.0,
@@ -213,7 +215,7 @@ def _restore_from_disk():
                 continue
             _videos[video_id] = {**meta, "id": video_id,
                                  "path": source, "dir": vdir}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, AttributeError):
             continue  # unreadable sidecar: skip this video, don't crash boot
 
         jobs_dir = os.path.join(vdir, "jobs")
@@ -225,21 +227,21 @@ def _restore_from_disk():
             try:
                 with open(os.path.join(jobs_dir, name)) as f:
                     data = json.load(f)
-            except (OSError, ValueError):
-                continue
-            box = data.get("hoop_box")
-            job = Job(
-                id=data["id"], video_id=video_id, mode=data.get("mode", "all"),
-                status=data.get("status", "error"),
-                progress=data.get("progress", 0.0),
-                message=data.get("message", ""),
-                events=data.get("events") or [],
-                clips=data.get("clips") or [],
-                error=data.get("error"),
-                hoop_box=tuple(box) if box else None,
-                device=data.get("device"),
-                created_at=data.get("created_at", 0.0),
-            )
+                box = data.get("hoop_box")
+                job = Job(
+                    id=data["id"], video_id=video_id, mode=data.get("mode", "all"),
+                    status=data.get("status", "error"),
+                    progress=data.get("progress", 0.0),
+                    message=data.get("message", ""),
+                    events=data.get("events") or [],
+                    clips=data.get("clips") or [],
+                    error=data.get("error"),
+                    hoop_box=tuple(box) if box else None,
+                    device=data.get("device"),
+                    created_at=data.get("created_at", 0.0),
+                )
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue  # unreadable or malformed job sidecar: skip it
             if job.status not in TERMINAL_STATES:
                 # Its worker thread died with the old process.
                 job.status = "error"
@@ -292,12 +294,14 @@ async def upload_video(file: UploadFile = File(...)):
                     raise HTTPException(413, "File is larger than the 2 GB upload limit.")
                 out.write(chunk)
         meta = engine.probe_video(dest)
-    except HTTPException:
-        shutil.rmtree(vdir, ignore_errors=True)
-        raise
     except ValueError as exc:
         shutil.rmtree(vdir, ignore_errors=True)
         raise HTTPException(422, str(exc))
+    except BaseException:
+        # Any failure (size limit, client gone mid-upload, disk full): don't
+        # leave a partial file behind for the next boot to adopt as a video.
+        shutil.rmtree(vdir, ignore_errors=True)
+        raise
 
     record = {
         "id": video_id,
@@ -366,9 +370,10 @@ def delete_video(video_id: str):
     with _lock:
         _videos.pop(video_id, None)
         # Drop this video's jobs too, otherwise they linger in the registry
-        # pointing at footage and clips that no longer exist.
+        # pointing at footage and clips that no longer exist. Cancel any that
+        # are still running so a worker doesn't keep analysing deleted footage.
         for jid in [j.id for j in _jobs.values() if j.video_id == video_id]:
-            _jobs.pop(jid, None)
+            _jobs.pop(jid).cancel_flag.set()
     shutil.rmtree(v["dir"], ignore_errors=True)
     return {"deleted": video_id}
 
@@ -395,8 +400,7 @@ def _load_roster(video: dict) -> dict:
 
 
 def _save_roster(video: dict, roster: dict):
-    with open(_roster_path(video), "w") as f:
-        json.dump(roster, f, indent=2)
+    _atomic_write_json(_roster_path(video), roster)
 
 
 def _next_color(players: list) -> str:
@@ -473,6 +477,9 @@ def create_job(req: JobRequest):
     b = req.hoop_box
     if b.x + b.w > v["width"] + 2 or b.y + b.h > v["height"] + 2:
         raise HTTPException(422, "The rim box falls outside the video frame. Mark it again.")
+    if req.clip_before_seconds + req.clip_after_seconds <= 0:
+        raise HTTPException(422, "Clips need some length — set the seconds before "
+                                 "or after the shot above zero.")
 
     job = Job(id=uuid.uuid4().hex, video_id=req.video_id, mode=req.mode,
               hoop_box=(b.x, b.y, b.w, b.h))
@@ -519,7 +526,13 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
         job.clips = engine.cut_clips(
             video["path"], analysis, job.mode, clip_dir, cfg,
             on_progress=progress, hoop_box=hoop_box,
+            should_cancel=job.cancel_flag.is_set,
         )
+        if job.cancel_flag.is_set():
+            # Cancel is offered while clipping too; don't report "done".
+            job.status = "cancelled"
+            job.message = "Cancelled"
+            return
         _write_coaching_meta(video, job.id, hoop_box)
         job.progress = 1.0
         n = len(job.clips)
@@ -532,8 +545,12 @@ def _run_job(job: Job, video: dict, hoop_box: tuple, cfg: engine.EngineConfig):
         job.message = "Processing failed"
     finally:
         # Durable either way: a finished job survives a restart, and a failed
-        # one keeps its error message instead of vanishing.
-        _persist_job(job, video)
+        # one keeps its error message instead of vanishing. Unless the video
+        # was deleted mid-run: writing the sidecar would recreate its folder.
+        with _lock:
+            video_still_exists = video["id"] in _videos
+        if video_still_exists:
+            _persist_job(job, video)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -582,8 +599,7 @@ def _write_coaching_meta(video: dict, job_id: str, hoop_box: tuple):
         data["hoop_box"] = dict(zip(("x", "y", "w", "h"), hoop_box))
         data["rim_diameter_ft"] = engine.RIM_DIAMETER_FT
         data.setdefault("assignments", {})
-        with open(_coaching_path(video, job_id), "w") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(_coaching_path(video, job_id), data)
 
 
 def _job_snapshot_enriched(job: Job) -> dict:
@@ -614,17 +630,16 @@ def assign_shot(job_id: str, frame: int, req: ShotAssignment):
     if not any(e["frame"] == frame for e in job.events):
         raise HTTPException(404, "Shot not found for this job.")
     video = _video_or_404(job.video_id)
-    if req.player_id is not None:
-        roster = _load_roster(video)
-        if not any(p["id"] == req.player_id for p in roster["players"]):
-            raise HTTPException(422, "Unknown player — add them to the roster first.")
     with _files_lock:
+        if req.player_id is not None:
+            roster = _load_roster(video)
+            if not any(p["id"] == req.player_id for p in roster["players"]):
+                raise HTTPException(422, "Unknown player — add them to the roster first.")
         data = _load_coaching(video, job_id)
         data.setdefault("assignments", {})[str(frame)] = {
             "player_id": req.player_id, "drill_tag": req.drill_tag,
         }
-        with open(_coaching_path(video, job_id), "w") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(_coaching_path(video, job_id), data)
     return {"frame": frame, "player_id": req.player_id, "drill_tag": req.drill_tag}
 
 

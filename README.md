@@ -98,9 +98,9 @@ No video fixtures, no YOLO weights, no network, and no test-only dependencies
 
 | File | Covers |
 |---|---|
-| `test_detector.py` | Synthetic trajectories: clean swish, front-rim brick, occluded swish, velocity across detection gaps, rebound cooldown, 9:16 crop geometry, rim-vs-ball shape scoring, device resolution. |
-| `test_export.py` | CSV rows and escaping, per-player/team stat tallies, removed-player fallbacks, real PDF generation (skips cleanly if matplotlib/reportlab are absent). |
-| `test_server.py` | Persistence round-trip and restart recovery, legacy-directory adoption, corrupt-sidecar tolerance, roster CRUD, shot-tagging guards (409/404/422), clip-path traversal rejection, export guards, zip contents, rim suggestion on a generated video. |
+| `test_detector.py` | Synthetic trajectories: clean swish, front-rim brick, occluded swish, velocity across detection gaps and after coasting, re-acquiring a lost track, rebound cooldown, 9:16 crop geometry, rim-vs-ball shape scoring, device resolution, cancelling a clip pass. |
+| `test_export.py` | CSV rows and escaping, per-player/team stat tallies, removed-player fallbacks, real PDF generation including a video name that looks like markup (skips cleanly if matplotlib/reportlab are absent). |
+| `test_server.py` | Persistence round-trip and restart recovery, legacy-directory adoption, corrupt- and malformed-sidecar tolerance, deleting or cancelling a job mid-run, roster CRUD, shot-tagging guards (409/404/422), status polls leaving job records untouched, clip-length guard, clip-path traversal rejection, export guards, zip contents, rim suggestion on a generated video. |
 
 ## Tuning
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import io
+from xml.sax.saxutils import escape
 
 DRILL_LABELS = {"layups": "Layups", "three_pointers": "3-Pointers",
                 "midrange": "Mid-range"}
@@ -163,7 +164,10 @@ def build_pdf(job_snapshot: dict, players_by_id: dict,
     ])
 
     story = [
-        Paragraph(f"ClipCourt Report — {video_display_name}", styles["Title"]),
+        # Paragraph parses its text as markup: a filename like "<b>final.mp4"
+        # would otherwise abort the whole report.
+        Paragraph(f"ClipCourt Report — {escape(video_display_name)}",
+                  styles["Title"]),
         Paragraph(
             f"{len(events)} shot{'s' if len(events) != 1 else ''} — "
             f"{made} made, {len(events) - made} missed. "
