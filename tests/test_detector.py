@@ -58,7 +58,7 @@ def arc(x0, y0, x1, y1, n):
 
 
 def test_clean_swish_is_made():
-    rim_cx = HOOP[0] + HOOP[1] // 2
+    rim_cx = HOOP[0] + HOOP[2] // 2
     pts = arc(rim_cx - 30, 60, 640, 320, 24)  # descends through band to below rim
     events = run_trajectory(pts)
     assert len(events) == 1, f"expected 1 event, got {len(events)}"
@@ -97,6 +97,49 @@ def test_velocity_not_inflated_across_gap():
     # 5-frame gap, ball moved 50px total => 10 px/frame, NOT 50.
     tracker.update([(150, 100, 24, 24, 0.9)], 5)
     assert abs(tracker.velocity[0] - 10.0) < 1e-6, tracker.velocity
+
+
+def test_velocity_after_coasting_uses_the_last_real_detection():
+    # Moving +10 px/frame, then two occluded (coasted) frames. When the ball
+    # is seen again the velocity must still read 10, not be shrunk by
+    # measuring from the coasted prediction over the full gap.
+    tracker = BallTracker(FRAME_W, EngineConfig())
+    for f in range(5):
+        tracker.update([(100 + 10 * f, 100, 24, 24, 0.9)], f)
+    assert tracker.update([], 5)[1] == "coasted"
+    assert tracker.update([], 6)[1] == "coasted"
+    tracker.update([(170, 100, 24, 24, 0.9)], 7)
+    assert abs(tracker.velocity[0] - 10.0) < 1e-6, tracker.velocity
+
+
+def test_reacquired_track_is_not_smoothed_toward_the_stale_position():
+    # Lost for longer than track_lost_frames, then seen across the frame: the
+    # point reported must be where the ball IS, not an EMA blend with where it
+    # was — that blend invents a ball crossing the frame (and the rim).
+    cfg = EngineConfig()
+    tracker = BallTracker(FRAME_W, cfg)
+    tracker.update([(100, 100, 24, 24, 0.9)], 0)
+    gap = cfg.track_lost_frames + 4
+    for f in range(1, gap):
+        tracker.update([], f)
+    point, kind = tracker.update([(1100, 600, 24, 24, 0.9)], gap)
+    assert kind == "measured"
+    assert point == (1100, 600), point
+    assert tracker.velocity == (0.0, 0.0), tracker.velocity
+
+
+def test_cut_clips_stops_when_cancelled():
+    import tempfile
+    from engine import AnalysisResult, ShotEvent, cut_clips
+    analysis = AnalysisResult(fps=FPS, frame_count=300, width=FRAME_W,
+                              height=FRAME_H, duration_s=10.0)
+    analysis.events = [ShotEvent(frame=90, time_s=3.0, result="made",
+                                 confidence="high")]
+    with tempfile.TemporaryDirectory() as out_dir:
+        clips = cut_clips("/nonexistent.mp4", analysis, "all", out_dir,
+                          EngineConfig(), should_cancel=lambda: True)
+        assert clips == [], clips
+        assert not [n for n in os.listdir(out_dir) if n.endswith(".mp4")]
 
 
 def test_track_lost_resolution_uses_last_known_position():

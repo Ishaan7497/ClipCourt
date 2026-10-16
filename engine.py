@@ -368,22 +368,27 @@ class BallTracker:
     def __init__(self, frame_w: int, cfg: EngineConfig):
         self.cfg = cfg
         self.max_jump_px = cfg.max_jump_ratio * frame_w
-        self.raw_pos: Optional[tuple] = None      # last accepted RAW center
+        self.raw_pos: Optional[tuple] = None      # last RAW center (coasting advances it)
+        self.measured_pos: Optional[tuple] = None # last RAW center actually detected
         self.smooth_pos: Optional[tuple] = None   # EMA-smoothed center
         self.last_seen_frame: Optional[int] = None
         self.velocity = (0.0, 0.0)                # px/frame, from raw positions
         self.coasted_left = 0
 
     def _accept(self, cx: float, cy: float, frame_idx: int):
-        if self.raw_pos is not None and self.last_seen_frame is not None:
+        if self.measured_pos is not None and self.last_seen_frame is not None:
             gap = max(1, frame_idx - self.last_seen_frame)
             # Velocity per frame divides by the REAL gap — the old inflation
-            # bug came from treating a multi-frame delta as one frame.
+            # bug came from treating a multi-frame delta as one frame. Measure
+            # from the last DETECTION, not the coasted prediction: the gap is
+            # counted from that detection, and the prediction has already
+            # moved part of the way.
             self.velocity = (
-                (cx - self.raw_pos[0]) / gap,
-                (cy - self.raw_pos[1]) / gap,
+                (cx - self.measured_pos[0]) / gap,
+                (cy - self.measured_pos[1]) / gap,
             )
         self.raw_pos = (cx, cy)
+        self.measured_pos = (cx, cy)
         self.last_seen_frame = frame_idx
         self.coasted_left = self.cfg.coast_frames
         a = self.cfg.ema_alpha
@@ -401,6 +406,15 @@ class BallTracker:
         kind is 'measured' or 'coasted'. point is the smoothed center.
         """
         best = None
+        if detections and self.last_seen_frame is not None and \
+                frame_idx - self.last_seen_frame > self.cfg.track_lost_frames:
+            # Track is stale. The jump allowance grows with the gap, so a long
+            # gap would let almost any detection "continue" it, and the EMA
+            # would then drag the new sighting back toward where the ball
+            # used to be, inventing points that cross the frame. Start over.
+            self.raw_pos = self.measured_pos = self.smooth_pos = None
+            self.velocity = (0.0, 0.0)
+
         if detections:
             if self.raw_pos is None:
                 # No track yet: take the most confident candidate.
@@ -418,12 +432,6 @@ class BallTracker:
                         scored.append((d[4] - 0.5 * (dist / max(allowed, 1e-6)), d))
                 if scored:
                     best = max(scored, key=lambda s: s[0])[1]
-                elif self.last_seen_frame is not None and \
-                        frame_idx - self.last_seen_frame > self.cfg.track_lost_frames:
-                    # Track is stale — re-seed on the most confident detection.
-                    best = max(detections, key=lambda d: d[4])
-                    self.velocity = (0.0, 0.0)
-                    self.raw_pos = None
 
         if best is not None:
             self._accept(best[0], best[1], frame_idx)
@@ -631,9 +639,13 @@ def analyze_video(
                             f"Analyzing frame {frame_idx:,} on {on_device}")
 
     cap.release()
-    if not total:
-        result.frame_count = frame_idx + 1
-        result.duration_s = result.frame_count / fps
+    # The container's frame count is an estimate (often wrong for VFR phone
+    # footage or webm/mkv). If decoding ran past it, shots near the end would
+    # fall after the reported duration and get an end-before-start clip window.
+    decoded = frame_idx + 1
+    if not total or decoded > total:
+        result.frame_count = decoded
+        result.duration_s = decoded / fps
     if on_progress:
         on_progress(1.0, "Analysis complete")
     return result
@@ -703,8 +715,12 @@ def cut_clips(
     cfg: EngineConfig,
     on_progress: Optional[ProgressCB] = None,
     hoop_box: Optional[tuple] = None,
+    should_cancel: Optional[CancelCheck] = None,
 ) -> list:
-    """Cut one clip per (merged) shot window. Returns clip metadata dicts."""
+    """Cut one clip per (merged) shot window. Returns clip metadata dicts.
+
+    Cancellation is checked between clips; a cancelled run stops early and
+    returns what it has cut so far."""
     os.makedirs(out_dir, exist_ok=True)
     wanted = [e for e in analysis.events if mode == "all" or e.result == mode]
     duration = analysis.duration_s or (analysis.frame_count / analysis.fps)
@@ -722,6 +738,8 @@ def cut_clips(
     done = 0
 
     for i, (start, end, events) in enumerate(windows, 1):
+        if should_cancel and should_cancel():
+            break
         label = "-".join(sorted({e.result for e in events}))
         name = f"clip_{i:02d}_{label}_{_ts(start)}.mp4"
         out_path = os.path.join(out_dir, name)
