@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install system packages (OpenCV runtime, ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y libgl1 ffmpeg
+      - name: Install dependencies
+        # The tests never run YOLO, so skip ultralytics (and its large PyTorch download).
+        run: |
+          grep -v ultralytics requirements.txt > ci-requirements.txt
+          pip install -r ci-requirements.txt pytest
+      - run: pytest -v
