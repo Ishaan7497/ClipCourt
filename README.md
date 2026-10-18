@@ -1,8 +1,17 @@
-# ClipCourt
+# 🏀 ClipCourt
+
+[![tests](https://github.com/Ishaan7497/ClipCourt/actions/workflows/tests.yml/badge.svg)](https://github.com/Ishaan7497/ClipCourt/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![YOLOv8](https://img.shields.io/badge/YOLOv8-ultralytics-purple)
+![FastAPI](https://img.shields.io/badge/FastAPI-backend-009688)
+![OpenCV](https://img.shields.io/badge/OpenCV-4.x-5C3EE8)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Turn **any** basketball footage into highlight clips. Upload a video, draw one box around the rim in your browser, and get made/miss-classified clips back — with the original audio, cut frame-accurately.
 
 The structural difference from apps like Hooper: nothing has to be recorded inside an app. Old camcorder tape, a parent's phone video, a league's tripod footage — if it plays, ClipCourt can process it.
+
+![ClipCourt upload screen](docs/screenshot.png)
 
 ## Quick start
 
@@ -135,3 +144,7 @@ database. Otherwise: put uvicorn behind nginx with a matching
 - [x] Per-session shot chart from event coordinates
 - [ ] Multi-process job registry (Redis/DB) for horizontal scaling
 - [ ] Auto-suggest a rim box per *camera angle* rather than per video
+
+## License
+
+[MIT](LICENSE)
