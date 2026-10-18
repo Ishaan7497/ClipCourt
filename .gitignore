@@ -25,3 +25,4 @@ data/
 
 # Local scratch
 /Screenshot*.png
+.pytest_cache/
