@@ -13,6 +13,8 @@ The structural difference from apps like Hooper: nothing has to be recorded insi
 
 ![ClipCourt upload screen](docs/screenshot.png)
 
+## Why I built this
+
 ## Quick start
 
 ```bash
