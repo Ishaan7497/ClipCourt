@@ -1,4 +1,4 @@
-# 🏀 ClipCourt
+# ClipCourt
 
 [![tests](https://github.com/Ishaan7497/ClipCourt/actions/workflows/tests.yml/badge.svg)](https://github.com/Ishaan7497/ClipCourt/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
